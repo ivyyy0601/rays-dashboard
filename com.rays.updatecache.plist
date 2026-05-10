@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rays.updatecache</string>
+
+    <!-- Direct Python call avoids macOS TCC restrictions on Desktop folder for /bin/bash -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/chenjiexin/Desktop/rays/venv/bin/python</string>
+        <string>/Users/chenjiexin/Desktop/rays/run_daily.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/chenjiexin/Desktop/rays</string>
+
+    <!-- 每天本地 19:40 (7:40 PM) 跑, 跑 ~15-20 分钟, 8 PM 完成 + 邮件发出 -->
+    <!-- 假设 Mac 在 NY 时区: 7:40 PM ET = 美股收盘后 3.5 小时, 所有数据齐全 -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>19</integer>
+        <key>Minute</key>
+        <integer>40</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/chenjiexin/Desktop/rays/data/update.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/chenjiexin/Desktop/rays/data/update_err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

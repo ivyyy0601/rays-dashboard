@@ -1,0 +1,22 @@
+# Sensitive credentials — NEVER commit these
+email_config.json
+tushare_token.json
+
+# Local data caches
+data/breadth_cache.json
+data/putcall_history.csv
+data/alert_log.csv
+data/update.log
+data/update_err.log
+data/cron.log
+data/streamlit.log
+data/stockcharts/
+data/barchart_pc.png
+data/aaii_sentiment.xls
+data/sentiment.xls
+
+# Python virtual environment
+venv/
+__pycache__/
+*.pyc
+.DS_Store

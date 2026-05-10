@@ -1,0 +1,16 @@
+yfinance>=0.2.40
+pandas>=2.0
+numpy
+streamlit>=1.30
+plotly
+requests
+beautifulsoup4
+lxml
+openpyxl
+xlrd
+akshare>=1.18
+baostock
+tushare
+pandas_ta
+streamlit-autorefresh
+playwright

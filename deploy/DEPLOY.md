@@ -125,7 +125,7 @@ http://YOUR_IP/
 sudo -u rays /opt/rays/venv/bin/python /opt/rays/run_daily.py
 ```
 
-跑 ~15 分钟, 完成后会发邮件给你和 meloli@rayscapital.com.
+跑 ~15 分钟, 完成后会发邮件给你.
 
 ---
 

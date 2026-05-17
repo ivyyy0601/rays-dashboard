@@ -3,6 +3,7 @@ import logging
 import subprocess
 import warnings
 from datetime import datetime, timedelta
+from pathlib import Path
 import io
 
 import pandas as pd
@@ -523,16 +524,29 @@ def _parse_aaii_xls(content: bytes) -> pd.DataFrame:
     return out.sort_values("Date").reset_index(drop=True)
 
 
+AAII_LOCAL_FILE = Path(__file__).parent / "data" / "aaii_sentiment.xls"
+
+
 @st.cache_data(ttl=3600)
 def fetch_aaii_sentiment() -> pd.DataFrame:
     """Returns DataFrame with columns Date, Bullish, Neutral, Bearish, Net.
 
-    Uses subprocess curl (different TLS fingerprint than requests, bypasses
-    AAII's Imperva-based anti-bot). Falls back to requests if curl unavailable.
+    Order:
+    1. Local file at data/aaii_sentiment.xls (pushed by GitHub Actions or
+       uploaded manually via dashboard) — most reliable, survives restarts.
+    2. curl (works on Mac, blocked by Imperva on Hetzner).
+    3. requests (last resort).
     """
+    # Method 1: local file (preferred — persists across refreshes/restarts)
+    if AAII_LOCAL_FILE.exists() and AAII_LOCAL_FILE.stat().st_size > 10000:
+        try:
+            return _parse_aaii_xls(AAII_LOCAL_FILE.read_bytes())
+        except Exception:
+            pass
+
     url = "https://www.aaii.com/files/surveys/sentiment.xls"
 
-    # Method 1: curl (works around the 403 we get from `requests`)
+    # Method 2: curl
     try:
         result = subprocess.run([
             "curl", "-s", "-L",
@@ -544,17 +558,22 @@ def fetch_aaii_sentiment() -> pd.DataFrame:
             url,
         ], capture_output=True, timeout=30)
         if result.returncode == 0 and len(result.stdout) > 10000:
+            # Cache to disk so future refreshes don't re-fetch
+            AAII_LOCAL_FILE.parent.mkdir(exist_ok=True)
+            AAII_LOCAL_FILE.write_bytes(result.stdout)
             return _parse_aaii_xls(result.stdout)
     except Exception:
         pass
 
-    # Method 2: requests (may 403, kept as fallback)
+    # Method 3: requests
     try:
         r = requests.get(url, timeout=15, headers={
             "User-Agent": "Mozilla/5.0",
             "Referer": "https://www.aaii.com/sentimentsurvey",
         })
         if r.status_code == 200 and len(r.content) > 10000:
+            AAII_LOCAL_FILE.parent.mkdir(exist_ok=True)
+            AAII_LOCAL_FILE.write_bytes(r.content)
             return _parse_aaii_xls(r.content)
     except Exception:
         pass
@@ -563,9 +582,16 @@ def fetch_aaii_sentiment() -> pd.DataFrame:
 
 
 def parse_aaii_upload(file) -> pd.DataFrame:
-    """Parse a manually uploaded sentiment.xls file."""
+    """Parse a manually uploaded sentiment.xls file AND save it to disk
+    so it persists across browser refreshes and Streamlit restarts."""
     try:
-        return _parse_aaii_xls(file.read())
+        content = file.read()
+        AAII_LOCAL_FILE.parent.mkdir(exist_ok=True)
+        AAII_LOCAL_FILE.write_bytes(content)
+        # Clear the cache so next call picks up the new file
+        if hasattr(fetch_aaii_sentiment, "clear"):
+            fetch_aaii_sentiment.clear()
+        return _parse_aaii_xls(content)
     except Exception:
         return pd.DataFrame()
 

@@ -162,11 +162,14 @@ with tab1:
         st.info(
             "Auto-fetch blocked by AAII (403). Workaround: download "
             "[sentiment.xls](https://www.aaii.com/files/surveys/sentiment.xls) "
-            "in your browser, then upload it below."
+            "in your browser, then upload it below. The file will be saved "
+            "to disk so you only need to upload once per week."
         )
         uploaded = st.file_uploader("Upload AAII sentiment.xls", type=["xls", "xlsx"], key="aaii_upload")
         if uploaded is not None:
             aaii = data.parse_aaii_upload(uploaded)
+            if not aaii.empty:
+                st.success(f"✓ Saved to disk — {len(aaii)} rows. Refresh-safe.")
 
     if not aaii.empty:
         latest = aaii.iloc[-1]

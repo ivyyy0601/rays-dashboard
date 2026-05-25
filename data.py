@@ -659,6 +659,9 @@ def fetch_stockcharts_image(symbol: str, period: str) -> str:
 
 # ---------- Put/Call ----------
 
+BARCHART_LOCAL_JSON = Path(__file__).parent / "data" / "barchart_pc.json"
+
+
 @st.cache_data(ttl=90000)  # 25 hours
 def fetch_putcall_ratio() -> dict:
     """S&P 500 ($SPX) put/call ratio scraped directly from Barchart.
@@ -666,8 +669,26 @@ def fetch_putcall_ratio() -> dict:
     Same source the boss linked to in his email:
         https://www.barchart.com/stocks/quotes/$SPX/put-call-ratios
 
-    Falls back to SPY options chain (yfinance) if Barchart scrape fails.
+    Order:
+    0. Local JSON at data/barchart_pc.json (pushed by GitHub Actions) — preferred,
+       because server's datacenter IP is blocked by Cloudflare on barchart.com.
+    1. Direct curl scrape (works from residential IPs only).
+    2. SPY options chain (yfinance) as last-resort fallback — different instrument,
+       different numbers; only useful as a rough proxy.
     """
+    # Method 0: local JSON pushed by GitHub Actions (preferred — bypasses Cloudflare)
+    if BARCHART_LOCAL_JSON.exists():
+        try:
+            import json as _json
+            import time as _time
+            age_hours = (_time.time() - BARCHART_LOCAL_JSON.stat().st_mtime) / 3600
+            if age_hours < 36:  # accept up to 36h old (covers weekends between weekday cron runs)
+                cached = _json.loads(BARCHART_LOCAL_JSON.read_text())
+                if cached.get("vol_ratio") and cached.get("oi_ratio"):
+                    return cached
+        except Exception:
+            pass
+
     # Method 1: Barchart $SPX (authoritative — same numbers the boss sees)
     try:
         ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "

@@ -51,6 +51,8 @@ jobs:
         if: steps.task.outputs.task == 'barchart' || github.event_name == 'workflow_dispatch'
         run: |
           python <<'EOF'
+          import json, re
+          from datetime import datetime, timezone
           from playwright.sync_api import sync_playwright
           with sync_playwright() as p:
               browser = p.chromium.launch(headless=True)
@@ -60,16 +62,52 @@ jobs:
               page.goto('https://www.barchart.com/stocks/quotes/$SPX/put-call-ratios',
                         wait_until='load', timeout=60000)
               page.wait_for_timeout(15000)
+
+              # Screenshot the chart
               svg_count = page.locator('svg').count()
               if svg_count >= 2:
                   page.locator('svg').nth(1).screenshot(path='barchart_pc.png')
-                  print(f'✓ Saved (svg count: {svg_count})')
+                  print(f'✓ Screenshot saved (svg count: {svg_count})')
               else:
                   print(f'⚠️ Only {svg_count} SVGs — likely blocked')
                   page.screenshot(path='barchart_pc.png')
+
+              # Scrape the 6 numeric values from page HTML (same regex as data.py)
+              html = page.content()
+              def grab(label):
+                  m = re.search(label + r'</span></div><div[^>]*>([\d,]+(?:\.\d+)?)', html)
+                  if m:
+                      return m.group(1).replace(',', '')
+                  m = re.search(label + r'.{0,200}?>\s*([\d,]+(?:\.\d+)?)\s*<', html, re.DOTALL)
+                  return m.group(1).replace(',', '') if m else None
+
+              vol_pc = grab(r'Put/Call Volume Ratio')
+              oi_pc = grab(r'Put/Call Open Interest Ratio')
+              put_vol = grab(r'Put Volume Total')
+              call_vol = grab(r'Call Volume Total')
+              put_oi = grab(r'Put Open Interest Total')
+              call_oi = grab(r'Call Open Interest Total')
+
+              if vol_pc and oi_pc:
+                  out = {
+                      "source": "Barchart $SPX (via GitHub Actions)",
+                      "vol_ratio": float(vol_pc),
+                      "oi_ratio": float(oi_pc),
+                      "total_put_vol": int(float(put_vol)) if put_vol else 0,
+                      "total_call_vol": int(float(call_vol)) if call_vol else 0,
+                      "total_put_oi": int(float(put_oi)) if put_oi else 0,
+                      "total_call_oi": int(float(call_oi)) if call_oi else 0,
+                      "by_expiry": [],
+                      "asof": datetime.now(timezone.utc).isoformat(),
+                  }
+                  with open('barchart_pc.json', 'w') as f:
+                      json.dump(out, f, indent=2)
+                  print(f'✓ Numbers scraped: vol={vol_pc}, oi={oi_pc}')
+              else:
+                  print(f'⚠️ Failed to scrape numbers: vol_pc={vol_pc}, oi_pc={oi_pc}')
               browser.close()
           EOF
-          ls -la barchart_pc.png
+          ls -la barchart_pc.png barchart_pc.json 2>/dev/null || ls -la barchart_pc.png
 
       - name: Setup SSH key
         run: |
@@ -89,3 +127,10 @@ jobs:
         run: |
           scp barchart_pc.png root@${{ secrets.SERVER_IP }}:/opt/rays/data/barchart_pc.png
           ssh root@${{ secrets.SERVER_IP }} "chown rays:rays /opt/rays/data/barchart_pc.png"
+          if [ -f barchart_pc.json ]; then
+            scp barchart_pc.json root@${{ secrets.SERVER_IP }}:/opt/rays/data/barchart_pc.json
+            ssh root@${{ secrets.SERVER_IP }} "chown rays:rays /opt/rays/data/barchart_pc.json"
+            echo "✓ Pushed barchart_pc.json"
+          else
+            echo "⚠️ No barchart_pc.json to push (scrape failed)"
+          fi

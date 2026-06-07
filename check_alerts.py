@@ -76,32 +76,36 @@ def build_snapshot() -> dict:
             "Bearish": float(latest["Bearish"]),
         }
 
-    # Tab 2: RSI + Turnover for each index (SAME logic as dashboard.py)
-    FORCE_ETF_TICKERS = {"^RUT", "^SOX"}  # yfinance bugs for these
+    # Volume Δ from the daily cache (same source as dashboard Tab 2).
+    vol_cache = {}
+    if CACHE_FILE.exists():
+        try:
+            _c = json.loads(CACHE_FILE.read_text())
+            for r in _c.get("rows", []):
+                if r.get("volume_dev") is not None:
+                    vol_cache[r["Index"]] = r["volume_dev"]
+        except Exception:
+            pass
+
+    # Tab 2: RSI + Volume Δ for each index (SAME logic & source as dashboard.py)
     tab2_rows = []
     for name, conf in config.INDICES.items():
         df_idx = data.fetch_yf_history(conf["index"], days=500)
-        df_etf = data.fetch_yf_history(conf["etf"], days=500)
         if df_idx.empty:
             continue
-        rsi = indicators.compute_rsi(df_idx["Close"], config.RSI_WINDOW)
-        rsi_latest = float(rsi.iloc[-1]) if not rsi.empty else None
+        # RSI(14): pulled directly from TradingView (matches dashboard table &
+        # tradingview.com). Falls back to locally-computed RSI if TV is unavailable.
+        rsi_latest = data.fetch_tv_rsi(name)
+        if rsi_latest is None:
+            rsi = indicators.compute_rsi(df_idx["Close"], config.RSI_WINDOW)
+            rsi_latest = float(rsi.iloc[-1]) if not rsi.empty else None
 
-        # Match dashboard's logic: prefer index volume, fall back to ETF
-        if conf["index"] in FORCE_ETF_TICKERS:
-            idx_has_volume = False
+        # Volume Δ vs 20d — real trading volume, no ETF. Prefer cache; live fallback.
+        if name in vol_cache:
+            delta = vol_cache[name]
         else:
-            idx_has_volume = (
-                "Volume" in df_idx.columns
-                and df_idx["Volume"].tail(5).fillna(0).median() > 0
-            )
-        if idx_has_volume:
-            tov = indicators.turnover_summary(df_idx["Close"], df_idx["Volume"], 20)
-        elif not df_etf.empty and "Volume" in df_etf.columns:
-            tov = indicators.turnover_summary(df_etf["Close"], df_etf["Volume"], 20)
-        else:
-            tov = {"deviation_pct": None}
-        delta = tov.get("deviation_pct")
+            vsum = data.fetch_index_volume_summary(name, 20)
+            delta = vsum.get("deviation_pct") if vsum else None
         tab2_rows.append({
             "Index": name,
             "RSI(14)": f"{rsi_latest:.1f}" if rsi_latest is not None else "—",
@@ -137,21 +141,34 @@ def send_email(subject: str, body_html: str, body_text: str, cfg: dict):
         server.send_message(msg)
 
 
-def format_email(triggered: list, ts: datetime) -> tuple:
-    """Returns (text_body, html_body)."""
+def format_email(triggered: list, ts: datetime, ai_summary: str = None) -> tuple:
+    """Returns (text_body, html_body). ai_summary, if present, is prepended."""
     text_lines = [
-        f"Market Sentiment Dashboard — Daily Alert Summary",
+        f"Market Sentiment Dashboard — Daily Brief",
         f"Generated: {ts.strftime('%Y-%m-%d %H:%M ET')}",
-        "",
-        f"{len(triggered)} alert(s) triggered:",
         "",
     ]
     html_parts = [f"""
     <div style='font-family:-apple-system,sans-serif; max-width:600px;'>
-      <h2 style='color:#1a1a1a;'>📊 Market Sentiment Daily Alert</h2>
+      <h2 style='color:#1a1a1a;'>📊 Market Sentiment Daily Brief</h2>
       <p style='color:#666;'>Generated: {ts.strftime('%Y-%m-%d %H:%M ET')}</p>
-      <p><b>{len(triggered)} alert(s) triggered:</b></p>
     """]
+
+    # AI summary at the top
+    if ai_summary:
+        text_lines += ["🤖 AI ANALYSIS", "", ai_summary, "", "—" * 30, ""]
+        import html as _html
+        safe = _html.escape(ai_summary).replace("\n", "<br>")
+        html_parts.append(f"""
+        <div style='border:1px solid #c7d2fe; border-radius:8px; padding:14px 16px;
+                    margin:12px 0; background:#eef2ff;'>
+          <div style='font-weight:700; color:#4338ca; margin-bottom:8px;'>🤖 AI Analysis</div>
+          <div style='color:#1e293b; line-height:1.5; white-space:normal;'>{safe}</div>
+        </div>
+        """)
+
+    text_lines += [f"{len(triggered)} alert(s) triggered:", ""]
+    html_parts.append(f"<p><b>{len(triggered)} alert(s) triggered:</b></p>")
     severity_color = {"high": "#dc2626", "medium": "#d97706", "info": "#2563eb"}
     for a in triggered:
         text_lines.append(f"  [{a['severity'].upper()}] {a['title']}")
@@ -197,8 +214,19 @@ def main():
 
     append_log(triggered, ts)
 
-    if not triggered:
-        print("  No alerts — skipping email.")
+    # AI daily summary across all tabs (None if no ANTHROPIC_API_KEY configured)
+    ai_summary = None
+    try:
+        import ai_analysis
+        ai_summary = ai_analysis.daily_summary(snapshot)
+        print(f"  AI summary: {'generated' if ai_summary else 'skipped (no API key)'}")
+    except Exception as e:
+        print(f"  AI summary failed: {type(e).__name__}: {e}")
+
+    # Send when there are alerts OR an AI brief to deliver. With no alerts and no
+    # AI key, preserve the old behavior (no email).
+    if not triggered and not ai_summary:
+        print("  No alerts and no AI summary — skipping email.")
         return
 
     if not EMAIL_CONFIG.exists():
@@ -206,8 +234,10 @@ def main():
         return
 
     cfg = json.loads(EMAIL_CONFIG.read_text())
-    text_body, html_body = format_email(triggered, ts)
-    subject = f"📊 {len(triggered)} Market Alert(s) — {ts.strftime('%Y-%m-%d')}"
+    text_body, html_body = format_email(triggered, ts, ai_summary=ai_summary)
+    n = len(triggered)
+    subject = (f"📊 Market Daily Brief — {ts.strftime('%Y-%m-%d')}" if n == 0
+               else f"📊 {n} Market Alert(s) — {ts.strftime('%Y-%m-%d')}")
     try:
         send_email(subject, html_body, text_body, cfg)
         print(f"  ✓ Email sent to {cfg['to_emails']}")

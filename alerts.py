@@ -67,7 +67,9 @@ def check_rsi(rows: list) -> list:
 
 
 def check_turnover(rows: list) -> list:
-    """rows from Tab 2 table with 'Δ vs 20d' column like '+15.2%' or '-12.0%'."""
+    """rows from Tab 2 table with 'Δ vs 20d' column like '+15.2%' or '-12.0%'.
+
+    Metric is real trading VOLUME vs its 20-day average (no ETF)."""
     out = []
     for r in rows:
         delta_str = r.get("Δ vs 20d", "—").replace("%", "").replace("+", "").strip()
@@ -79,9 +81,9 @@ def check_turnover(rows: list) -> list:
             direction = "above" if delta > 0 else "below"
             out.append({
                 "severity": "info",
-                "title": f"📊 Turnover {direction.upper()} avg: {r['Index']} {delta:+.1f}%",
-                "message": f"{r['Index']} latest turnover is {delta:+.1f}% from 20-day average — "
-                           f"{'unusual buying interest' if delta > 0 else 'low participation'}.",
+                "title": f"📊 Volume {direction.upper()} avg: {r['Index']} {delta:+.1f}%",
+                "message": f"{r['Index']} latest trading volume is {delta:+.1f}% from its 20-day "
+                           f"average — {'unusual activity / buying interest' if delta > 0 else 'low participation'}.",
             })
     return out
 

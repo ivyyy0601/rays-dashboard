@@ -1,6 +1,7 @@
 # Sensitive credentials — NEVER commit these
 email_config.json
 tushare_token.json
+anthropic_key.json
 
 # Local data caches
 data/breadth_cache.json

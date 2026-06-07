@@ -94,19 +94,38 @@ def main():
         ad = indicators.daily_advance_decline(closes)
         ad_history = indicators.daily_advance_decline_history(closes, days=30)
         as_of = closes.index[-1].strftime("%Y-%m-%d") if not closes.empty else None
+
+        # Real trading VOLUME (no ETF) — computed here so the heavy constituent
+        # sums (e.g. Topix ~1,541 names) run in the cron, not on page load.
+        def _f(x):
+            return float(x) if x == x and x is not None else None  # NaN/None → None for JSON
+        try:
+            vsum = data.fetch_index_volume_summary(name, config.TURNOVER_AVG_WINDOW)
+        except Exception as e:
+            print(f"    volume failed: {e}")
+            vsum = {}
+
         rows.append({
             "Index": name,
             "as_of": as_of,
-            "pct_above_short": float(br["pct_above_short"]) if br["pct_above_short"] == br["pct_above_short"] else None,
-            "pct_above_long":  float(br["pct_above_long"])  if br["pct_above_long"]  == br["pct_above_long"]  else None,
-            "pct_above_both":  float(br["pct_above_both"])  if br["pct_above_both"]  == br["pct_above_both"]  else None,
-            "pct_below_both":  float(br["pct_below_both"])  if br["pct_below_both"]  == br["pct_below_both"]  else None,
-            "pct_up":          float(ad["pct_up"])          if ad["pct_up"]          == ad["pct_up"]          else None,
-            "pct_down":        float(ad["pct_down"])        if ad["pct_down"]        == ad["pct_down"]        else None,
+            "pct_above_short": _f(br["pct_above_short"]),
+            "pct_above_long":  _f(br["pct_above_long"]),
+            "pct_above_both":  _f(br["pct_above_both"]),
+            "pct_below_both":  _f(br["pct_below_both"]),
+            "pct_up":          _f(ad["pct_up"]),
+            "pct_down":        _f(ad["pct_down"]),
             "n_stocks": int(br["n_stocks"]),
             "ad_history": ad_history,  # list of {date, pct_up, pct_down, net} for last 30 days
+            # Real volume (no ETF) — read by Tab 2
+            "volume_latest": _f(vsum.get("latest")),
+            "volume_avg20":  _f(vsum.get("avg20")),
+            "volume_dev":    _f(vsum.get("deviation_pct")),
+            "volume_source": vsum.get("source"),
+            "volume_unit":   vsum.get("unit"),
         })
-        print(f"    n={br['n_stocks']}, above_both={br['pct_above_both']:.1f}%, as_of={as_of}, ad_history={len(ad_history)}d")
+        _vd = vsum.get("deviation_pct")
+        _vinfo = f"{vsum.get('source')} Δ{_vd:+.1f}%" if _vd == _vd and _vd is not None else "—"
+        print(f"    n={br['n_stocks']}, above_both={br['pct_above_both']:.1f}%, as_of={as_of}, vol={_vinfo}")
 
     print("\nUpdating Put/Call history...")
     update_putcall_history()

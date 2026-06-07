@@ -11,6 +11,7 @@ xlrd
 akshare>=1.18
 baostock
 tushare
-pandas_ta
 streamlit-autorefresh
 playwright
+anthropic
+tradingview_ta

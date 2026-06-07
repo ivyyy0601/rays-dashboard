@@ -26,6 +26,53 @@ def turnover_summary(close: pd.Series, volume: pd.Series, window: int = 20) -> d
     return {"latest": float(latest), "avg20": float(avg), "deviation_pct": float(deviation)}
 
 
+def turnover_series_summary(turnover: pd.Series, window: int = 20) -> dict:
+    """Given a daily turnover series, return latest / prior-window avg / deviation%.
+
+    Two correctness fixes:
+    1. Drop trailing bars whose value is < 40% of the recent median (incomplete /
+       not-yet-settled bars that otherwise fire false LOW alerts).
+    2. Compare the latest value against the PRIOR `window` average (excludes today),
+       so a spike isn't diluted by being part of its own baseline.
+    """
+    s = turnover.dropna()
+    if len(s) < 3:
+        return {"latest": np.nan, "avg20": np.nan, "deviation_pct": np.nan, "n_dropped": 0}
+    med = s.tail(window).median()
+    n_dropped = 0
+    while len(s) > 2 and s.iloc[-1] < 0.4 * med:
+        s = s.iloc[:-1]
+        n_dropped += 1
+    latest = s.iloc[-1]
+    prior = s.iloc[-(window + 1):-1] if len(s) > window else s.iloc[:-1]
+    avg = prior.mean() if len(prior) else np.nan
+    dev = (latest / avg - 1) * 100 if avg and avg > 0 else np.nan
+    return {
+        "latest": float(latest),
+        "avg20": float(avg) if pd.notna(avg) else np.nan,
+        "deviation_pct": float(dev) if pd.notna(dev) else np.nan,
+        "n_dropped": n_dropped,
+    }
+
+
+def turnover_clean(close: pd.Series, volume: pd.Series, window: int = 20) -> dict:
+    """Turnover = close × volume, with two correctness fixes:
+
+    1. Drop trailing bars whose volume is < 40% of the recent median — these are
+       incomplete / not-yet-settled bars that otherwise produce false LOW alerts.
+    2. Compare the latest value against the PRIOR `window` average (excludes the
+       latest bar), so a spike isn't diluted by being part of its own baseline.
+
+    Returns latest, avg (prior window), deviation_pct, and n_dropped.
+    """
+    df = pd.DataFrame({"c": close, "v": volume}).dropna()
+    df["v"] = df["v"].replace(0, np.nan)
+    df = df.dropna(subset=["v"])
+    if len(df) < 3:
+        return {"latest": np.nan, "avg20": np.nan, "deviation_pct": np.nan, "n_dropped": 0}
+    return turnover_series_summary(df["c"] * df["v"], window)
+
+
 def breadth_above_both_ma(prices_df: pd.DataFrame, short: int = 50, long: int = 200) -> dict:
     """prices_df: index=dates, columns=tickers, values=close prices.
 

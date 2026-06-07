@@ -14,6 +14,7 @@ import streamlit as st
 import config
 import data
 import indicators
+import ai_analysis
 
 ET = ZoneInfo("America/New_York")
 CACHE_FILE = Path(__file__).parent / "data" / "breadth_cache.json"
@@ -54,7 +55,7 @@ st.info(
 )
 
 tab1, tab2, tab3, tab4 = st.tabs(
-    ["Volatility & Sentiment", "Indices (RSI / Turnover)", "Breadth & A/D", "Options"]
+    ["Volatility & Sentiment", "Indices (RSI / Volume)", "Breadth & A/D", "Options"]
 )
 
 # ============ TAB 1 ============
@@ -208,53 +209,85 @@ with tab1:
 
 # ============ TAB 2 ============
 with tab2:
-    st.subheader("RSI & Turnover by Index")
+    st.subheader("RSI & Volume by Index")
     st.caption(
         "📅 Each market's data becomes available at (all times in ET):  \n"
         "US ~16:15 (after 4pm close + 15 min feed delay)  ·  HK ~04:00  ·  "
         "A-share ~03:00  ·  Taiwan ~01:30  ·  Korea ~02:30"
     )
     st.caption(
-        "**Turnover = volume × closing price per day** (proxy, since indices don't have "
-        "direct turnover). Uses index ticker's own volume where available; falls back "
-        "to canonical ETF (SOXX/IWM/1306.T) when the index has no volume data."
+        "**Volume = real daily trading volume** (no ETF). Each index uses its own "
+        "aggregate volume; SOX sums its 30 constituents (^SOX has none) and Russell 2000 "
+        "uses RTY=F futures (^RUT volume is a yfinance bug). Units differ (shares / "
+        "contracts), so compare only the per-row **Δ vs 20d**, not absolute values."
     )
+    def _fmt_vol(v):
+        """Humanize share volume: 9.27B, 187.70M, 325,945."""
+        if not pd.notna(v):
+            return "—"
+        if v >= 1e9:
+            return f"{v/1e9:,.2f}B"
+        if v >= 1e6:
+            return f"{v/1e6:,.2f}M"
+        return f"{v:,.0f}"
+
+    def _fmt_amt(v):
+        """Humanize a turnover amount (native currency): 19.70B, 444.0M, 8.4M."""
+        if not pd.notna(v):
+            return "—"
+        if v >= 1e9:
+            return f"{v/1e9:,.2f}B"
+        if v >= 1e6:
+            return f"{v/1e6:,.1f}M"
+        return f"{v:,.0f}"
+
+    # Volume from the daily cache (heavy constituent sums like Topix run in cron).
+    # Indices missing here (e.g. Russell) are computed live below.
+    _vol_cache = {}
+    if CACHE_FILE.exists():
+        try:
+            _c = json.loads(CACHE_FILE.read_text())
+            for r in _c.get("rows", []):
+                if r.get("volume_dev") is not None:
+                    _vol_cache[r["Index"]] = r
+        except Exception:
+            _vol_cache = {}
+
     rows = []
     rsi_history = {}
     for name, conf in config.INDICES.items():
         df_idx = data.fetch_yf_history(conf["index"], days=config.HISTORY_DAYS)
-        df_etf = data.fetch_yf_history(conf["etf"], days=config.HISTORY_DAYS)
         if df_idx.empty:
             rows.append({"Index": name, "As of": "—", "Close": "—", "RSI(14)": "—",
-                         "RSI Alert": "—", "Source": "—", "Turnover": "—", "20d Avg": "—",
-                         "Δ vs 20d": "—", "Turnover Alert": "no data"})
+                         "RSI Alert": "—", "Volume Source": "—", "Volume": "—",
+                         "20d Avg": "—", "Δ vs 20d": "—", "Vol Alert": "no data"})
             continue
         close = df_idx["Close"]
+        # History chart: RSI computed locally (TradingView gives no historical series).
         rsi_series = indicators.compute_rsi(close, config.RSI_WINDOW)
         rsi_history[name] = rsi_series
-        rsi_latest = float(rsi_series.iloc[-1]) if not rsi_series.empty else float("nan")
+        # Table RSI(14): pulled directly from TradingView (matches tradingview.com).
+        # Falls back to the locally-computed value only if TradingView is unavailable.
+        rsi_latest = data.fetch_tv_rsi(name)
+        if rsi_latest is None:
+            rsi_latest = float(rsi_series.iloc[-1]) if not rsi_series.empty else float("nan")
 
-        # Turnover: prefer index's own volume × close; fall back to ETF if no index volume.
-        # KNOWN-BAD tickers: yfinance returns garbage volume for these, force ETF:
-        #   ^RUT  → returns ^GSPC's volume (yfinance bug)
-        #   ^SOX  → no volume
-        FORCE_ETF_TICKERS = {"^RUT", "^SOX"}
-        if conf["index"] in FORCE_ETF_TICKERS:
-            idx_has_volume = False
+        # Trading VOLUME (real, no ETF). Prefer the daily cache (so heavy sums like
+        # Topix don't run on page load); compute live for anything not cached
+        # (e.g. Russell 2000 → RTY=F futures, fast). Source per index:
+        #   Russell 2000 → RTY=F futures (^RUT volume is a yfinance bug)
+        #   SOX / Topix  → Σ constituents (their own tickers have no usable volume)
+        #   all others   → the index ticker's own aggregate volume
+        vc = _vol_cache.get(name)
+        if vc:
+            vsum = {"latest": vc.get("volume_latest"), "avg20": vc.get("volume_avg20"),
+                    "deviation_pct": vc.get("volume_dev"),
+                    "source": vc.get("volume_source") or "?", "unit": vc.get("volume_unit") or ""}
         else:
-            idx_has_volume = (
-                "Volume" in df_idx.columns
-                and df_idx["Volume"].tail(5).fillna(0).median() > 0
-            )
-        if idx_has_volume:
-            tov = indicators.turnover_summary(df_idx["Close"], df_idx["Volume"], config.TURNOVER_AVG_WINDOW)
-            tov_source = f"📊 Index ({conf['index']})"
-        elif not df_etf.empty and "Volume" in df_etf.columns:
-            tov = indicators.turnover_summary(df_etf["Close"], df_etf["Volume"], config.TURNOVER_AVG_WINDOW)
-            tov_source = f"🔄 ETF Proxy ({conf['etf']})"
-        else:
-            tov = {"latest": float("nan"), "avg20": float("nan"), "deviation_pct": float("nan")}
-            tov_source = "❌ N/A"
+            vsum = data.fetch_index_volume_summary(name, config.TURNOVER_AVG_WINDOW)
+        vdev = vsum.get("deviation_pct") if vsum else None
+        vol_source = vsum.get("source", "❌ N/A") if vsum else "❌ N/A"
+        vol_unit = vsum.get("unit", "") if vsum else ""
 
         if pd.notna(rsi_latest) and rsi_latest > config.RSI_UPPER:
             rsi_alert = f"OVERBOUGHT ({rsi_latest:.1f})"
@@ -263,15 +296,15 @@ with tab2:
         else:
             rsi_alert = "—"
 
-        if pd.notna(tov["deviation_pct"]):
-            if tov["deviation_pct"] > config.TURNOVER_DEVIATION_PCT:
-                tov_alert = f"HIGH (+{tov['deviation_pct']:.1f}%)"
-            elif tov["deviation_pct"] < -config.TURNOVER_DEVIATION_PCT:
-                tov_alert = f"LOW ({tov['deviation_pct']:.1f}%)"
+        if vdev is not None and vdev == vdev:
+            if vdev > config.TURNOVER_DEVIATION_PCT:
+                vol_alert = f"HIGH (+{vdev:.1f}%)"
+            elif vdev < -config.TURNOVER_DEVIATION_PCT:
+                vol_alert = f"LOW ({vdev:.1f}%)"
             else:
-                tov_alert = "—"
+                vol_alert = "—"
         else:
-            tov_alert = "—"
+            vol_alert = "—"
 
         rows.append({
             "Index": name,
@@ -279,56 +312,52 @@ with tab2:
             "Close": f"{float(close.iloc[-1]):,.2f}",
             "RSI(14)": f"{rsi_latest:.1f}" if pd.notna(rsi_latest) else "—",
             "RSI Alert": rsi_alert,
-            "Turnover Source": tov_source,
-            "Turnover": f"{tov['latest']/1e9:,.2f}B" if pd.notna(tov["latest"]) else "—",
-            "20d Avg": f"{tov['avg20']/1e9:,.2f}B" if pd.notna(tov["avg20"]) else "—",
-            "Δ vs 20d": f"{tov['deviation_pct']:+.1f}%" if pd.notna(tov["deviation_pct"]) else "—",
-            "Turnover Alert": tov_alert,
+            "Volume Source": f"{vol_source} ({vol_unit})" if vsum else "❌ N/A",
+            "Volume": _fmt_vol(vsum.get("latest")) if vsum else "—",
+            "20d Avg": _fmt_vol(vsum.get("avg20")) if vsum else "—",
+            "Δ vs 20d": f"{vdev:+.1f}%" if (vdev is not None and vdev == vdev) else "—",
+            "Vol Alert": vol_alert,
         })
+
+    # Stash for the AI sidebar chat (RSI + volume Δ per index)
+    st.session_state["ai_tab2_rows"] = rows
 
     # Height fits 12 indices + header without scroll
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, height=38 + 12 * 35)
 
-    with st.expander("📖 Turnover data source legend (per index)"):
+    with st.expander("📖 How Volume is calculated"):
         st.markdown("""
-**Source meaning:**
-- 📊 **Index (ticker)** = uses the index's own `volume × close` directly from yfinance
-- 🔄 **ETF Proxy (ticker)** = the index has no/unreliable volume on yfinance, so we use the canonical tracking ETF
-- ❌ **N/A** = no volume data available
+**Real daily trading volume — no ETF anywhere.** The `Volume Source` column shows each row's
+source:
 
-**Per-index source mapping:**
-
-| Index | Source | Why |
+| Indices | Source | Unit |
 |---|---|---|
-| S&P 500 | 📊 Index `^GSPC` | yfinance has aggregate volume |
-| Nasdaq 100 | 📊 Index `^NDX` | yfinance has aggregate volume |
-| **SOX** | 🔄 ETF `SOXX` | `^SOX` has no volume on yfinance |
-| **Russell 2000** | 🔄 ETF `IWM` | yfinance bug: `^RUT` volume = `^GSPC` volume |
-| Hang Seng | 📊 Index `^HSI` | yfinance HK volume OK |
-| CSI 300 | 📊 Index `000300.SS` | yfinance volume small but internally consistent |
-| CSI 1000 | 📊 Index `000852.SS` | uses akshare fallback for full data |
-| ChiNext | 📊 Index `399006.SZ` | uses akshare fallback for full data |
-| Nikkei 225 | 📊 Index `^N225` | yfinance JP volume OK |
-| Topix | 📊 Index `1308.T` | iShares Topix ETF (^TPX missing on yfinance) |
-| Taiwan | 📊 Index `^TWII` | yfinance TW volume OK |
-| KOSPI 200 | 📊 Index `^KS200` | yfinance KR volume OK |
+| S&P 500, Nasdaq 100, Hang Seng, Nikkei 225, Topix, Taiwan, KOSPI 200, CSI 300/1000, ChiNext | the index ticker's **own aggregate volume** (sum of constituent shares traded), straight from the data feed | shares |
+| **SOX** | **Σ of its 30 constituents'** volume — `^SOX` reports no volume of its own | shares |
+| **Russell 2000** | **RTY=F futures** contract volume — `^RUT`'s reported volume is a yfinance bug (it returns `^GSPC`'s number) | contracts |
 
-**Why ETF proxies for SOX & Russell 2000?**
-Indices themselves don't trade — they're calculated values. Some yfinance tickers (`^SOX`, `^RUT`)
-return missing or wrong volume data. We use the canonical tracking ETF (SOXX, IWM) which has
-real, audited trading volume. Bloomberg uses the same approach.
+**Units differ** (shares vs contracts, and shares mean different things across markets), so
+**don't compare the absolute `Volume` / `20d Avg` across rows** — only the per-row **`Δ vs 20d`**
+is meaningful, and that ratio is unit-agnostic.
 
-**Why some absolute B numbers look weird (e.g. Hang Seng 80,796B)?**
-yfinance's "volume" for index tickers represents the SUM of constituent shares traded across
-the index. Multiplying by the index level gives a number with no fixed unit — it's only
-meaningful in **relative terms** (today vs 20-day average). The ±10% deviation alert is
-mathematically correct regardless of absolute scale.
+**Two correctness fixes:**
+- **Incomplete bars dropped** — a not-yet-settled last bar (< 40% of the recent median) is
+  excluded, so it can't fire a false `LOW` alert.
+- **Baseline excludes today** — today's value is compared against the *prior* 20-day average,
+  not an average that already contains it.
+
+*Why not "turnover" (volume × price)?* An index has no real per-share price (only a point
+level), so `level × volume` is a meaningless number. Real turnover needs summing every
+constituent's `price × volume`; trading **volume** is published directly and is the clean,
+ETF-free activity signal.
 """)
 
     st.subheader("RSI History")
     pick = st.radio("Index", list(config.INDICES.keys()), horizontal=True, label_visibility="collapsed")
     if pick in rsi_history:
-        s = rsi_history[pick].dropna()
+        # Compute RSI on the full fetched series (accurate warmup), then show
+        # only the most recent RSI_CHART_DAYS trading days.
+        s = rsi_history[pick].dropna().tail(config.RSI_CHART_DAYS)
         fig = go.Figure()
         fig.add_trace(go.Scatter(
             x=s.index, y=s.values, name=f"{pick} RSI",
@@ -353,13 +382,24 @@ with tab3:
         return f"{v:.1f}%" if v is not None else "—"
 
     def _coverage_info(name: str, n: int):
-        """Return (sort_key, display_str, is_proxy)."""
+        """Return (sort_key, display_str, is_proxy).
+
+        Distinguishes three states so the table never just shows a bare blank:
+          - n == 0        → constituent source unavailable (data feed down)
+          - pct < 85%     → partial list (flag as approximate)
+          - pct >= 85%    → full coverage
+        """
         theo = config.INDEX_THEORETICAL_SIZE.get(name)
-        if not theo or not n:
+        if not theo:
             return (0, "—", False)
+        if not n:
+            return (0, "❌ no data", True)
         pct = n / theo * 100
-        is_proxy = pct < 50
-        label = f"⚠️ {pct:.0f}% (proxy)" if is_proxy else f"{pct:.0f}%"
+        is_proxy = pct < 85
+        if pct < 85:
+            label = f"⚠️ {n}/{theo} ({pct:.0f}%, partial)"
+        else:
+            label = f"{n}/{theo} ({pct:.0f}%)"
         return (pct, label, is_proxy)
 
     def _render_rows(cache_rows):
@@ -599,3 +639,89 @@ with tab4:
             "Could not capture Barchart chart. Open it directly: "
             "[barchart.com](https://www.barchart.com/stocks/quotes/$SPX/put-call-ratios)"
         )
+
+
+# ============ AI ANALYSIS SIDEBAR ============
+def _build_ai_snapshot():
+    """Assemble a cross-tab snapshot for the AI chat from cache + cached live data."""
+    snap = {}
+    # Tab 3 — breadth from the daily cache
+    if CACHE_FILE.exists():
+        try:
+            snap["breadth_rows"] = json.loads(CACHE_FILE.read_text()).get("rows", [])
+        except Exception:
+            pass
+    # Tab 2 — RSI + volume Δ captured during this run's render
+    snap["tab2_rows"] = st.session_state.get("ai_tab2_rows", [])
+    # Tab 1 — VIX, put/call, AAII (all @st.cache_data → cheap on rerun)
+    try:
+        vix = data.fetch_yf_history(config.VIX_TICKER, days=60)
+        if not vix.empty:
+            snap["vix_close"] = float(vix["Close"].iloc[-1])
+    except Exception:
+        pass
+    try:
+        snap["putcall"] = data.fetch_putcall_ratio() or {}
+    except Exception:
+        pass
+    try:
+        aaii = data.fetch_aaii_sentiment()
+        if not aaii.empty:
+            r = aaii.iloc[-1]
+            snap["aaii_latest"] = {"Bullish": float(r["Bullish"]),
+                                   "Neutral": float(r["Neutral"]),
+                                   "Bearish": float(r["Bearish"])}
+    except Exception:
+        pass
+    return snap
+
+
+with st.sidebar:
+    st.header("🤖 AI Market Analyst")
+    st.caption("Ask about the current dashboard data — VIX/sentiment, RSI & volume, breadth.")
+
+    if ai_analysis.get_api_key() is None:
+        st.info(
+            "AI chat is not configured. Add an Anthropic API key to enable it:\n\n"
+            "1. Get a key at console.anthropic.com\n"
+            "2. Create `anthropic_key.json` next to the app:\n"
+            "   `{\"api_key\": \"sk-ant-...\"}`\n"
+            "   (or set the `ANTHROPIC_API_KEY` env var)\n"
+            "3. Restart the app."
+        )
+    else:
+        if "ai_messages" not in st.session_state:
+            st.session_state.ai_messages = []
+
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            analyze = st.button("📋 Analyze today", use_container_width=True)
+        with c2:
+            if st.button("Clear", use_container_width=True):
+                st.session_state.ai_messages = []
+                st.rerun()
+
+        # Render history
+        for m in st.session_state.ai_messages:
+            with st.chat_message(m["role"]):
+                st.markdown(m["content"])
+
+        prompt = st.chat_input("Ask about the data…")
+        if analyze and not prompt:
+            prompt = ("Give me a concise read of the current market data across all tabs — "
+                      "what's stretched, where signals agree or diverge, and the net risk posture.")
+
+        if prompt:
+            st.session_state.ai_messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            snapshot = _build_ai_snapshot()
+            with st.chat_message("assistant"):
+                try:
+                    reply = st.write_stream(
+                        ai_analysis.stream_chat(st.session_state.ai_messages, snapshot)
+                    )
+                except Exception as e:
+                    reply = f"⚠️ AI request failed: {type(e).__name__}: {e}"
+                    st.error(reply)
+            st.session_state.ai_messages.append({"role": "assistant", "content": reply})

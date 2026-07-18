@@ -16,15 +16,16 @@ jobs:
       - name: Determine task type
         id: task
         run: |
-          # GitHub Actions 在凌晨 (UTC) 跑, 看是周四还是工作日
-          DOW=$(date -u +%u)
-          HOUR=$(date -u +%H)
-          if [ "$DOW" = "4" ] && [ "$HOUR" = "15" ]; then
+          # 用触发这次 run 的 cron 表达式本身判断任务类型, 不用实时时钟。
+          # GitHub Actions 的 schedule 触发经常延迟(排队), 用 `date -u` 取当前小时
+          # 一旦延迟跨过整点就会误判——这正是之前 AAII 抓取被静默跳过几周的原因。
+          SCHEDULE="${{ github.event.schedule }}"
+          if [ "$SCHEDULE" = "30 15 * * 4" ]; then
             echo "task=aaii" >> $GITHUB_OUTPUT
           else
             echo "task=barchart" >> $GITHUB_OUTPUT
           fi
-          echo "Task type: $(grep task= $GITHUB_OUTPUT | head -1)"
+          echo "Task type: $(grep task= $GITHUB_OUTPUT | head -1) (schedule='$SCHEDULE')"
 
       - name: Fetch AAII (Thursdays only)
         if: steps.task.outputs.task == 'aaii' || github.event_name == 'workflow_dispatch'

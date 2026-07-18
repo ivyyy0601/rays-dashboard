@@ -10,25 +10,14 @@ on:
   workflow_dispatch:  # 允许手动触发测试
 
 jobs:
-  fetch-and-sync:
+  # AAII 和 Barchart 拆成两个独立 job: 任何一个失败(比如 Barchart 页面截图超时)
+  # 都不应该拖累另一个——之前两者共用一个 job, Barchart 截图失败会导致
+  # 后面的 "Push AAII to server" 步骤被跳过, 明明 AAII 已经抓到了却没推上去。
+  fetch-aaii:
+    if: github.event.schedule == '30 15 * * 4' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - name: Determine task type
-        id: task
-        run: |
-          # 用触发这次 run 的 cron 表达式本身判断任务类型, 不用实时时钟。
-          # GitHub Actions 的 schedule 触发经常延迟(排队), 用 `date -u` 取当前小时
-          # 一旦延迟跨过整点就会误判——这正是之前 AAII 抓取被静默跳过几周的原因。
-          SCHEDULE="${{ github.event.schedule }}"
-          if [ "$SCHEDULE" = "30 15 * * 4" ]; then
-            echo "task=aaii" >> $GITHUB_OUTPUT
-          else
-            echo "task=barchart" >> $GITHUB_OUTPUT
-          fi
-          echo "Task type: $(grep task= $GITHUB_OUTPUT | head -1) (schedule='$SCHEDULE')"
-
-      - name: Fetch AAII (Thursdays only)
-        if: steps.task.outputs.task == 'aaii' || github.event_name == 'workflow_dispatch'
+      - name: Fetch AAII
         run: |
           curl -sL -o sentiment.xls \
             -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15" \
@@ -42,36 +31,58 @@ jobs:
             exit 1
           fi
 
-      - name: Setup Playwright (for Barchart)
-        if: steps.task.outputs.task == 'barchart' || github.event_name == 'workflow_dispatch'
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts
+
+      - name: Push AAII to server
+        run: |
+          scp sentiment.xls root@${{ secrets.SERVER_IP }}:/opt/rays/data/aaii_sentiment.xls
+          ssh root@${{ secrets.SERVER_IP }} "chown rays:rays /opt/rays/data/aaii_sentiment.xls"
+
+  fetch-barchart:
+    if: github.event.schedule == '0 23 * * 1-5' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Playwright
         run: |
           pip install playwright
           playwright install chromium --with-deps
 
       - name: Capture Barchart chart
-        if: steps.task.outputs.task == 'barchart' || github.event_name == 'workflow_dispatch'
         run: |
           python <<'EOF'
           import json, re
           from datetime import datetime, timezone
-          from playwright.sync_api import sync_playwright
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
           with sync_playwright() as p:
               browser = p.chromium.launch(headless=True)
               ctx = browser.new_context(viewport={'width': 1600, 'height': 1200},
                                          user_agent='Mozilla/5.0 Chrome/120')
               page = ctx.new_page()
               page.goto('https://www.barchart.com/stocks/quotes/$SPX/put-call-ratios',
-                        wait_until='load', timeout=60000)
+                        wait_until='load', timeout=90000)
               page.wait_for_timeout(15000)
 
-              # Screenshot the chart
+              # Screenshot the chart — best-effort. A timeout here (chart slow to
+              # render / never becomes visible) must NOT crash the whole step,
+              # since the numeric scrape below is the data that actually matters.
               svg_count = page.locator('svg').count()
-              if svg_count >= 2:
-                  page.locator('svg').nth(1).screenshot(path='barchart_pc.png')
-                  print(f'✓ Screenshot saved (svg count: {svg_count})')
-              else:
-                  print(f'⚠️ Only {svg_count} SVGs — likely blocked')
-                  page.screenshot(path='barchart_pc.png')
+              try:
+                  if svg_count >= 2:
+                      target = page.locator('svg').nth(1)
+                      target.wait_for(state='visible', timeout=60000)
+                      target.screenshot(path='barchart_pc.png', timeout=60000)
+                      print(f'✓ Screenshot saved (svg count: {svg_count})')
+                  else:
+                      print(f'⚠️ Only {svg_count} SVGs — likely blocked')
+                      page.screenshot(path='barchart_pc.png', timeout=60000)
+              except PWTimeout as e:
+                  print(f'⚠️ Screenshot failed, continuing without it: {e}')
 
               # Scrape the 6 numeric values from page HTML (same regex as data.py)
               html = page.content()
@@ -117,17 +128,15 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts
 
-      - name: Push AAII to server
-        if: steps.task.outputs.task == 'aaii' || github.event_name == 'workflow_dispatch'
-        run: |
-          scp sentiment.xls root@${{ secrets.SERVER_IP }}:/opt/rays/data/aaii_sentiment.xls
-          ssh root@${{ secrets.SERVER_IP }} "chown rays:rays /opt/rays/data/aaii_sentiment.xls"
-
       - name: Push Barchart to server
-        if: steps.task.outputs.task == 'barchart' || github.event_name == 'workflow_dispatch'
         run: |
-          scp barchart_pc.png root@${{ secrets.SERVER_IP }}:/opt/rays/data/barchart_pc.png
-          ssh root@${{ secrets.SERVER_IP }} "chown rays:rays /opt/rays/data/barchart_pc.png"
+          if [ -f barchart_pc.png ]; then
+            scp barchart_pc.png root@${{ secrets.SERVER_IP }}:/opt/rays/data/barchart_pc.png
+            ssh root@${{ secrets.SERVER_IP }} "chown rays:rays /opt/rays/data/barchart_pc.png"
+            echo "✓ Pushed barchart_pc.png"
+          else
+            echo "⚠️ No barchart_pc.png to push (screenshot failed)"
+          fi
           if [ -f barchart_pc.json ]; then
             scp barchart_pc.json root@${{ secrets.SERVER_IP }}:/opt/rays/data/barchart_pc.json
             ssh root@${{ secrets.SERVER_IP }} "chown rays:rays /opt/rays/data/barchart_pc.json"

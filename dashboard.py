@@ -581,6 +581,19 @@ with tab4:
     )
     pc = data.fetch_putcall_ratio()
     if pc and pc.get("vol_ratio") is not None:
+        asof_display = None
+        if pc.get("asof"):
+            try:
+                asof_dt = pd.to_datetime(pc["asof"])
+                if asof_dt.tzinfo is not None:
+                    asof_dt = asof_dt.tz_convert("America/New_York")
+                asof_display = asof_dt.strftime("%Y-%m-%d %H:%M ET")
+            except Exception:
+                asof_display = str(pc["asof"])
+        st.caption(
+            f"As of: **{asof_display or 'unknown'}**  ·  Source: **{pc.get('source', 'unknown')}**"
+        )
+
         c1, c2, c3 = st.columns(3)
         with c1:
             st.metric("Volume P/C Ratio", f"{pc['vol_ratio']:.2f}",
@@ -595,7 +608,7 @@ with tab4:
             st.metric("Open Interest P/C Ratio", f"{pc['oi_ratio']:.2f}",
                      help="Cumulative put OI / call OI — measures positioning")
         with c3:
-            st.metric("Source", "Barchart $SPX", help="Auto-scraped, refreshed by daily cron")
+            st.metric("Source", pc.get("source", "unknown"), help="Auto-scraped, refreshed by daily cron")
 
         # Volume / OI summary
         st.write("**Aggregate (next 4 expirations):**")

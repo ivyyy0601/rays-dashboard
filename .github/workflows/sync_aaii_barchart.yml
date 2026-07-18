@@ -32,6 +32,7 @@ jobs:
           fi
 
       - name: Setup SSH key
+        if: always()
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
@@ -42,6 +43,25 @@ jobs:
         run: |
           scp sentiment.xls root@${{ secrets.SERVER_IP }}:/opt/rays/data/aaii_sentiment.xls
           ssh root@${{ secrets.SERVER_IP }} "chown rays:rays /opt/rays/data/aaii_sentiment.xls"
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          cat > /tmp/notify_failure.py <<'EOF'
+          import sys, json
+          sys.path.insert(0, "/opt/rays")
+          from check_alerts import send_email, EMAIL_CONFIG
+
+          job, run_url = sys.argv[1], sys.argv[2]
+          cfg = json.load(open(EMAIL_CONFIG))
+          subject = f"⚠️ Rays Dashboard: '{job}' GitHub Actions job failed"
+          text = f"Job '{job}' failed.\n\nSee logs: {run_url}"
+          html = f"<p>Job <b>{job}</b> failed.</p><p><a href='{run_url}'>View logs</a></p>"
+          send_email(subject, html, text, cfg)
+          print("Failure notification email sent.")
+          EOF
+          scp /tmp/notify_failure.py root@${{ secrets.SERVER_IP }}:/tmp/notify_failure.py
+          ssh root@${{ secrets.SERVER_IP }} "sudo -u rays /opt/rays/venv/bin/python3 /tmp/notify_failure.py 'fetch-aaii' 'https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'"
 
   fetch-barchart:
     if: github.event.schedule == '0 23 * * 1-5' || github.event_name == 'workflow_dispatch'
@@ -122,6 +142,7 @@ jobs:
           ls -la barchart_pc.* 2>/dev/null || echo "⚠️ No chart files found"
 
       - name: Setup SSH key
+        if: always()
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
@@ -144,3 +165,22 @@ jobs:
           else
             echo "⚠️ No barchart_pc.json to push (scrape failed)"
           fi
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          cat > /tmp/notify_failure.py <<'EOF'
+          import sys, json
+          sys.path.insert(0, "/opt/rays")
+          from check_alerts import send_email, EMAIL_CONFIG
+
+          job, run_url = sys.argv[1], sys.argv[2]
+          cfg = json.load(open(EMAIL_CONFIG))
+          subject = f"⚠️ Rays Dashboard: '{job}' GitHub Actions job failed"
+          text = f"Job '{job}' failed.\n\nSee logs: {run_url}"
+          html = f"<p>Job <b>{job}</b> failed.</p><p><a href='{run_url}'>View logs</a></p>"
+          send_email(subject, html, text, cfg)
+          print("Failure notification email sent.")
+          EOF
+          scp /tmp/notify_failure.py root@${{ secrets.SERVER_IP }}:/tmp/notify_failure.py
+          ssh root@${{ secrets.SERVER_IP }} "sudo -u rays /opt/rays/venv/bin/python3 /tmp/notify_failure.py 'fetch-barchart' 'https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'"

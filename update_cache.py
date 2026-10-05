@@ -46,32 +46,25 @@ logging.disable(logging.CRITICAL)
 
 
 def update_putcall_history():
-    """Append today's put/call ratio to the rolling history CSV."""
+    """Record each source retrieval once, never date old data as today's market."""
     import pandas as pd
     pc = data.fetch_putcall_ratio()
-    if not pc or pc.get("vol_ratio") is None:
-        print("  Put/Call: failed to fetch, skipping history update")
+    if not pc or pc.get("vol_ratio") is None or pc.get("stale"):
+        print("  Put/Call: validated fresh source snapshot unavailable; history unchanged")
         return
-    today = datetime.now(ET).strftime("%Y-%m-%d")
-    new_row = {
-        "date": today,
-        "vol_ratio": pc["vol_ratio"],
-        "oi_ratio": pc["oi_ratio"],
-        "put_vol": pc.get("total_put_vol"),
-        "call_vol": pc.get("total_call_vol"),
-        "put_oi": pc.get("total_put_oi"),
-        "call_oi": pc.get("total_call_oi"),
-        "source": pc.get("source", ""),
-    }
-    if PUTCALL_HISTORY.exists():
-        hist = pd.read_csv(PUTCALL_HISTORY)
-        hist = hist[hist["date"] != today]  # remove same-day if running again
-        hist = pd.concat([hist, pd.DataFrame([new_row])], ignore_index=True)
-    else:
-        hist = pd.DataFrame([new_row])
-    hist = hist.sort_values("date").reset_index(drop=True)
-    hist.to_csv(PUTCALL_HISTORY, index=False)
-    print(f"  Put/Call: vol={pc['vol_ratio']:.2f}, oi={pc['oi_ratio']:.2f} → {len(hist)} rows in history")
+    captured = pd.Timestamp(pc["asof"])
+    path = DATA_DIR / "putcall_snapshots.csv"
+    row = {"retrieved_at": captured.isoformat(), "date_basis": "retrieval, not exchange observation",
+           "vol_ratio": pc["vol_ratio"], "oi_ratio": pc["oi_ratio"],
+           "put_vol": pc["total_put_vol"], "call_vol": pc["total_call_vol"],
+           "put_oi": pc["total_put_oi"], "call_oi": pc["total_call_oi"], "source": pc["source"]}
+    hist = pd.read_csv(path) if path.exists() else pd.DataFrame()
+    if not hist.empty and row["retrieved_at"] in set(hist["retrieved_at"]):
+        print("  Put/Call: this source snapshot is already recorded")
+        return
+    hist = pd.concat([hist, pd.DataFrame([row])], ignore_index=True)
+    hist.to_csv(path, index=False)
+    print(f"  Put/Call: recorded source snapshot {captured}; legacy history preserved")
 
 
 def main():

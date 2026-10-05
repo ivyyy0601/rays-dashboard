@@ -87,11 +87,11 @@ def breadth_above_both_ma(prices_df: pd.DataFrame, short: int = 50, long: int = 
                 "pct_above_both": np.nan, "pct_below_both": np.nan, "n_stocks": 0}
     # Forward-fill scattered NaN gaps (holidays, halts, stale data) so a single
     # missing day in the 200-day window doesn't kill the entire rolling MA.
-    filled = prices_df.ffill()
+    filled = prices_df.ffill(limit=2)
     ma_s = filled.rolling(short).mean().iloc[-1]
     ma_l = filled.rolling(long).mean().iloc[-1]
     last = filled.iloc[-1]
-    valid = ma_s.notna() & ma_l.notna() & last.notna()
+    valid = ma_s.notna() & ma_l.notna() & last.notna() & prices_df.iloc[-1].notna()
     n = int(valid.sum())
     if n == 0:
         return {"pct_above_short": np.nan, "pct_above_long": np.nan,
@@ -131,9 +131,8 @@ def daily_advance_decline_history(prices_df: pd.DataFrame, days: int = 30) -> li
     """
     if prices_df.empty or prices_df.shape[0] < 2:
         return []
-    # Forward-fill to bridge minor data gaps (1-2 missing days)
-    filled = prices_df.ffill()
-    pct = filled.pct_change().tail(days)
+    # Missing observations are not zero returns or one-day catch-up returns.
+    pct = prices_df.pct_change(fill_method=None).tail(days)
     out = []
     for date, row in pct.iterrows():
         valid = row.notna()

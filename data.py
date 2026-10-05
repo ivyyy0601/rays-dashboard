@@ -618,43 +618,40 @@ def constituents_nikkei225() -> list:
     ]
 
 
+def parse_topix_weights(content: str, now=None):
+    """Parse JPX's dated TOPIX membership, never substitute a market segment."""
+    import re
+    frame = pd.read_csv(io.StringIO(content), dtype={"Code": str, "Date": str})
+    required = {"Code", "Date", "Component Weight (TOPIX)"}
+    if not required.issubset(frame.columns):
+        raise ValueError("JPX TOPIX weights schema changed")
+    # JPX appends prose notes after the data rows.
+    frame = frame[frame["Code"].notna() | frame["Date"].str.fullmatch(r"\d{8}", na=False)]
+    dates = pd.to_datetime(frame["Date"], format="%Y%m%d", errors="raise")
+    if dates.nunique() != 1:
+        raise ValueError("Mixed TOPIX constituent dates")
+    asof = dates.iloc[0]
+    current = pd.Timestamp.now(tz="Asia/Tokyo").tz_localize(None) if now is None else pd.Timestamp(now).tz_localize(None)
+    if not 0 <= (current.normalize() - asof).days <= 90:
+        raise ValueError("TOPIX constituent file is stale or future-dated")
+    codes = frame["Code"].str.strip()
+    weights = pd.to_numeric(frame["Component Weight (TOPIX)"].str.rstrip("%"), errors="raise")
+    if not codes.map(lambda c: bool(re.fullmatch(r"[0-9]{3}[0-9A-Z]", c))).all() or codes.duplicated().any():
+        raise ValueError("Invalid TOPIX constituent codes")
+    if len(codes) < 1000 or not weights.ge(0).all() or not 99 <= weights.sum() <= 101:
+        raise ValueError("Incomplete TOPIX constituent weights")
+    return [c + ".T" for c in codes], asof.strftime("%Y-%m-%d")
+
+
 @st.cache_data(ttl=86400)
 def constituents_topix() -> list:
-    """Topix constituents = TSE Prime market full list (~1,574 stocks).
-
-    Source: JPX (Japan Exchange Group) official Excel file, free + public.
-    Topix index IS the TSE Prime market post-2022 reorganization.
-    Falls back to EWJ ETF holdings (~180 stocks), then Nikkei 225, if JPX fails.
-    """
-    try:
-        # JPX switched this file from .xls to .xlsx in 2026 (the .xls URL now 404s).
-        url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xlsx"
-        r = requests.get(url, headers=_WIKI_HEADERS, timeout=30)
-        if r.status_code == 200 and len(r.content) > 50000:
-            df = pd.read_excel(io.BytesIO(r.content), sheet_name=0)
-            # Filter to "プライム（内国株式）" = TSE Prime domestic stocks
-            market_col = next((c for c in df.columns if "市場" in str(c) or "Market" in str(c)), None)
-            code_col = next((c for c in df.columns if "コード" in str(c) or "Code" in str(c)), None)
-            if market_col and code_col:
-                prime = df[df[market_col].astype(str).str.contains("プライム.*内国|Prime.*Domestic", regex=True, na=False)]
-                codes = prime[code_col].dropna().astype(str).str.zfill(4)
-                # Codes are 4 chars; newer listings are alphanumeric (e.g. "285A").
-                tickers = [c + ".T" for c in codes if c.isalnum() and len(c) == 4]
-                if len(tickers) >= 1000:
-                    CONSTITUENT_SOURCE["Topix"] = "JPX listed companies (Prime)"
-                    return tickers
-    except Exception:
-        pass
-
-    # Fallback 1: EWJ (~180 stocks)
-    ewj = _ishares_holdings("239665", "EWJ")
-    valid = [t + ".T" for t in ewj if t.isdigit() and len(t) == 4]
-    if len(valid) >= 100:
-        CONSTITUENT_SOURCE["Topix"] = "iShares EWJ holdings (fallback)"
-        return valid
-    # Fallback 2: Nikkei 225
-    CONSTITUENT_SOURCE["Topix"] = "Nikkei 225 list (fallback)"
-    return constituents_nikkei225()
+    """Official monthly TOPIX list; JPX publishes it with a month-end lag."""
+    url = "https://www.jpx.co.jp/automation/english/markets/indices/topix/files/topixweight_e.csv"
+    response = requests.get(url, headers=_WIKI_HEADERS, timeout=30)
+    response.raise_for_status()
+    tickers, asof = parse_topix_weights(response.content.decode("cp932"))
+    CONSTITUENT_SOURCE["Topix"] = f"JPX TOPIX constituent weights (as of {asof}; monthly publication lag)"
+    return tickers
 
 
 CONSTITUENT_FETCHERS = {

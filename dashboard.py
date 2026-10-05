@@ -67,9 +67,9 @@ else:
 
 st.caption(
     f"🕐 **Page opened: {now_str} ET**  ·  "
-    f"📦 **Data last updated: {last_update_str}** — refreshed once a day at 08:00 Hong Kong "
-    f"time. Every figure uses each market's latest **completed** trading day; nothing on this "
-    f"page is fetched live."
+    f"📦 **Breadth cache written: {last_update_str}** — refreshed once a day at 08:00 Hong Kong "
+    f"time for index analytics. Individual panels show their own observation or retrieval dates; "
+    f"AAII and options follow separate source schedules."
 )
 
 st.info(
@@ -265,12 +265,15 @@ with tab2:
     else:
         built = pd.to_datetime(snap["built_at_et"]).strftime("%Y-%m-%d %H:%M ET")
         st.caption(
-            f"📸 Daily snapshot built **{built}** — every number below comes from that one run "
-            "(nothing is fetched live). **Volume** and **Turnover** are the sums over all of the "
-            "index's constituents; turnover = Σ close × volume, shown in USD. "
+            f"📸 Daily snapshot built **{built}**. Price and activity dates are shown per row "
+            "(nothing is fetched live). **Volume** and **Turnover** sum the available data for the selected constituent list; "
+            "turnover = Σ close × volume, shown in USD. "
             "**Δ vs 20d** and **Alert** use turnover: the latest session vs the average of the "
             "20 sessions before it (local currency)."
         )
+
+        if snap.get("corrected_at_utc"):
+            st.caption(f"Data correction applied: {snap['corrected_at_utc']}. See per-row dates and source notes.")
 
     def _fmt_num(v, prefix=""):
         """Humanize: 9.27B, 187.70M, 325,945."""
@@ -356,10 +359,10 @@ previous session. The table, the RSI chart, the alert email and the AI chat all 
 **Why constituent sums:** the "index volume" fields on Yahoo / Sina were checked against official
 figures and don't measure the index itself (^NDX and Sina's ChiNext report the whole exchange /
 board, ^GSPC is revised to a wider number overnight, ^N225 uses an unknown unit, RTY=F is futures).
-Σ constituents matched every official figure available (Nasdaq, CNI, CSIndex, TradingView).
+Constituent lists and vendor coverage can differ from the current official index membership.
 
-**Turnover is close × volume**, an estimate — within ~2% of official turnover (checked on ChiNext,
-CSI 300, CSI 1000; the 20-day Δ matched official within 0.3 pts).
+**Turnover is close × volume**, an estimate, not the exchange-reported cash traded.
+TOPIX uses the official dated JPX monthly weights, which are published with a lag.
 
 **Constituent lists** are re-fetched every run from the index publisher, exchange or a
 tracking ETF's daily holdings (SPY, Nasdaq, Nasdaq index data for SOX, iShares/Vanguard for
@@ -592,18 +595,18 @@ with tab4:
         c1, c2, c3 = st.columns(3)
         with c1:
             st.metric("Volume P/C Ratio", f"{pc['vol_ratio']:.2f}",
-                     help="Today's put volume / call volume — measures the day's flow")
+                     help="Snapshot put volume / call volume. The source trading date is not supplied.")
             if pc['vol_ratio'] > 1.2:
-                st.error("⚠️ Bearish: heavy put buying")
+                st.info("Put volume is higher than call volume in this snapshot.")
             elif pc['vol_ratio'] < 0.7:
-                st.success("📈 Bullish: heavy call buying")
+                st.info("Call volume is higher than put volume in this snapshot.")
             else:
                 st.info("Neutral range")
         with c2:
             st.metric("Open Interest P/C Ratio", f"{pc['oi_ratio']:.2f}",
                      help="Cumulative put OI / call OI — measures positioning")
         with c3:
-            st.metric("Source", pc.get("source", "unknown"), help="Auto-scraped, refreshed by daily cron")
+            st.metric("Source", pc.get("source", "unknown"), help="Numeric snapshots are synced by the GitHub Actions workflow; a server run alone does not refresh them.")
 
         # Volume / OI summary
         st.write("**Barchart SPX reported totals:**")
@@ -619,8 +622,8 @@ with tab4:
 
         st.caption(
             "**How to read:**  \n"
-            "• **Volume P/C > 1.2** → heavy put buying today (fear / hedging) — often contrarian bullish at extremes  \n"
-            "• **Volume P/C < 0.7** → heavy call buying (greed) — often contrarian bearish at extremes  \n"
+            "• **Volume P/C** compares put and call trading volume in this snapshot.  \n"
+            "• Volume includes both buyers and sellers; it does not establish directional positioning.  \n"
             "• **OI P/C** shows accumulated positioning over time"
         )
     else:

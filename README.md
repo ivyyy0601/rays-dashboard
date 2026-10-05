@@ -181,3 +181,20 @@ The web app always reads the cache, so page loads stay fast regardless of pipeli
 ---
 
 *Personal project — market sentiment monitoring across global equity indices.*
+
+## Data integrity notes
+
+TOPIX constituent activity now uses JPX's official dated monthly TOPIX weight CSV,
+not the TSE Prime market list. JPX publishes these weights with a month-end lag;
+the source date is included in the UI. Download failures and files older than
+90 days do not fall back to a different index or market universe.
+TradingView previous-session close/RSI values without an observation timestamp
+keep an unknown price date; activity dates cannot supply missing price dates.
+Breadth excludes stocks missing the latest close; historical daily A/D does not
+forward-fill missing daily returns.
+
+Put/call numeric snapshots are synced by GitHub Actions. The daily server job
+records each source retrieval once in `data/putcall_snapshots.csv`, explicitly
+labelled as retrieval time rather than exchange observation time. Legacy
+`putcall_history.csv` is preserved and is not extended with copied daily values.
+Tests: `python -m unittest discover -s tests -v`.

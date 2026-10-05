@@ -173,6 +173,8 @@ def _track_list(name: str, tickers: list, now: datetime, notes: list) -> dict:
     if "fallback" in source:
         notes.append(f"constituent list came from a fallback source ({source}) — may be stale")
 
+    if name == "Topix":
+        notes.append("TOPIX membership uses JPX's dated monthly weights; later constituent changes may not yet be included")
     current = sorted(set(tickers))
     last_changed = today
     if prev:
@@ -375,7 +377,10 @@ def build_row(name: str, now: datetime, price: dict, notes: list) -> dict:
     n_price_notes = len(notes)
     row.update(_activity_block(name, now, notes))
     if row.pop("price_date_from_activity", False):
-        row["price_date"] = row.get("activity_date")
+        # TradingView's previous-session value has no source timestamp. An
+        # activity date from another feed cannot establish its observation date.
+        row["price_date"] = None
+        notes.append("previous-session close/RSI supplied without an observation date")
     # Constituent-list / volume checks only — what Tab 3's breadth shares with Tab 2
     row["data_notes"] = notes[n_price_notes:]
 

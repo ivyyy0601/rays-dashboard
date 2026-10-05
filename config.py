@@ -73,7 +73,7 @@ INDEX_THEORETICAL_SIZE = {
     "CSI 1000":    1000,
     "ChiNext":     100,
     "Nikkei 225":  225,
-    "Topix":       1574,    # TSE Prime market = Topix (post-2022 reorganization)
+    "Topix":       None,    # Dynamic JPX TOPIX month-end membership; not the Prime market list
     "Taiwan":      1100,    # TWSE listed stocks ~1,100 (full list via TWSE openapi)
     "KOSPI 200":   200,
 }

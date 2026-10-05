@@ -1,0 +1,23 @@
+# Daily data refresh + alert email — runs once and exits (triggered by rays-daily.timer).
+#   run_daily.py = update_cache.py (index snapshot: Tab 2 turnover + Tab 3 breadth,
+#   put/call history) + check_alerts.py (alerts + AI brief → email)
+#
+# Server path: /etc/systemd/system/rays-daily.service
+# Run manually: sudo systemctl start rays-daily
+# Log: tail -f /opt/rays/data/cron.log
+
+[Unit]
+Description=Rays daily data refresh + alert email
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=rays
+Group=rays
+WorkingDirectory=/opt/rays
+Environment="PATH=/opt/rays/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="TZ=America/New_York"
+ExecStart=/opt/rays/venv/bin/python /opt/rays/run_daily.py
+StandardOutput=append:/opt/rays/data/cron.log
+StandardError=append:/opt/rays/data/cron.log

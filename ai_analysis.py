@@ -72,15 +72,15 @@ def format_snapshot(snapshot: dict) -> str:
     if vol:
         lines.append("## Volatility & Sentiment\n" + "\n".join(f"- {v}" for v in vol))
 
-    # Tab 2 — Indices (RSI / Volume)
+    # Tab 2 — Indices (RSI / Turnover)
     rows = snapshot.get("tab2_rows") or []
     if rows:
         body = "\n".join(
             f"- {r['Index']}: RSI(14) {r.get('RSI(14)', '—')}, "
-            f"volume Δ vs 20d {r.get('Δ vs 20d', '—')}"
+            f"turnover {r.get('Turnover (USD)', '—')} (Δ vs 20d {r.get('Δ vs 20d', '—')})"
             for r in rows
         )
-        lines.append("## Indices — RSI & Volume\n" + body)
+        lines.append("## Indices — RSI & Turnover\n" + body)
 
     # Tab 3 — Breadth & A/D
     breadth = snapshot.get("breadth_rows") or []
@@ -91,7 +91,8 @@ def format_snapshot(snapshot: dict) -> str:
             f"- {r.get('Index')}: % >50MA {_p(r.get('pct_above_short'))}, "
             f"% >200MA {_p(r.get('pct_above_long'))}, "
             f"% up today {_p(r.get('pct_up'))} / down {_p(r.get('pct_down'))} "
-            f"(as of {r.get('as_of') or '—'})"
+            f"(as of {r.get('as_of') or '—'}; coverage {r.get('n_stocks', '—')}/"
+            f"{r.get('n_list', '—')} — {r.get('coverage_note', 'n/a')})"
             for r in breadth
         )
         lines.append("## Breadth & Advance/Decline\n" + body)
@@ -102,14 +103,14 @@ def format_snapshot(snapshot: dict) -> str:
 _SYSTEM = (
     "You are a buy-side market strategist writing a concise daily internal brief. "
     "You are given a cross-asset snapshot covering volatility & sentiment (VIX, AAII, "
-    "put/call), index momentum (RSI, real trading-volume deviation vs the 20-day average), "
+    "put/call), index momentum (RSI, turnover deviation vs the 20-day average), "
     "and market breadth (% of constituents above the 50/200-day moving averages, advancers "
     "vs decliners). Interpret the data as a whole: call out what is stretched (overbought/"
-    "oversold RSI, breadth extremes, unusual volume), where signals agree or diverge across "
+    "oversold RSI, breadth extremes, unusual turnover), where signals agree or diverge across "
     "regions (US / China / HK / Japan / Taiwan / Korea), and the net risk posture. Be "
     "specific and quantitative, cite the numbers, and never invent data that is not present. "
-    "Note that index volume figures are in each market's native unit and are comparable only "
-    "as a per-row Δ vs 20d, not in absolute terms across rows."
+    "Index turnover is the sum of all constituents' close × volume, shown in USD, so it is "
+    "comparable across markets; Δ vs 20d is measured in local currency."
 )
 
 

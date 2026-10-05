@@ -36,7 +36,7 @@ sys.modules["streamlit"] = fake_st
 import alerts
 import config
 import data
-import indicators
+import index_snapshot
 
 
 ET = ZoneInfo("America/New_York")
@@ -54,11 +54,11 @@ def build_snapshot() -> dict:
     snapshot = {}
 
     # VIX
-    vix = data.fetch_yf_history(config.VIX_TICKER, days=200)
+    vix = data.load_market_series(config.VIX_TICKER)
     snapshot["vix_close"] = float(vix["Close"].iloc[-1]) if not vix.empty else None
 
     # GLD/VIX 10-week momentum
-    gld = data.fetch_yf_history(config.GLD_TICKER, days=300)
+    gld = data.load_market_series(config.GLD_TICKER)
     if not gld.empty and not vix.empty:
         gld_w = gld["Close"].resample("W-FRI").last()
         vix_w = vix["Close"].resample("W-FRI").last()
@@ -76,40 +76,17 @@ def build_snapshot() -> dict:
             "Bearish": float(latest["Bearish"]),
         }
 
-    # Volume Δ from the daily cache (same source as dashboard Tab 2).
-    vol_cache = {}
-    if CACHE_FILE.exists():
-        try:
-            _c = json.loads(CACHE_FILE.read_text())
-            for r in _c.get("rows", []):
-                if r.get("volume_dev") is not None:
-                    vol_cache[r["Index"]] = r["volume_dev"]
-        except Exception:
-            pass
-
-    # Tab 2: RSI + Volume Δ for each index (SAME logic & source as dashboard.py)
+    # Tab 2: RSI + turnover Δ from the daily index snapshot (same file as the
+    # dashboard table). A row that failed its data checks carries no Δ.
+    idx_snap = index_snapshot.load() or index_snapshot.build_and_save()
     tab2_rows = []
-    for name, conf in config.INDICES.items():
-        df_idx = data.fetch_yf_history(conf["index"], days=500)
-        if df_idx.empty:
-            continue
-        # RSI(14): pulled directly from TradingView (matches dashboard table &
-        # tradingview.com). Falls back to locally-computed RSI if TV is unavailable.
-        rsi_latest = data.fetch_tv_rsi(name)
-        if rsi_latest is None:
-            rsi = indicators.compute_rsi(df_idx["Close"], config.RSI_WINDOW)
-            rsi_latest = float(rsi.iloc[-1]) if not rsi.empty else None
-
-        # Volume Δ vs 20d — real trading volume, no ETF. Prefer cache; live fallback.
-        if name in vol_cache:
-            delta = vol_cache[name]
-        else:
-            vsum = data.fetch_index_volume_summary(name, 20)
-            delta = vsum.get("deviation_pct") if vsum else None
+    for r in idx_snap.get("rows", []):
+        dev = r.get("turnover_dev")
         tab2_rows.append({
-            "Index": name,
-            "RSI(14)": f"{rsi_latest:.1f}" if rsi_latest is not None else "—",
-            "Δ vs 20d": f"{delta:+.1f}%" if delta is not None and delta == delta else "—",
+            "Index": r["Index"],
+            "RSI(14)": f"{r['rsi']:.1f}" if r.get("rsi") is not None else "—",
+            "Turnover (USD)": f"${r['turnover_usd'] / 1e9:,.1f}B" if r.get("turnover_usd") else "—",
+            "Δ vs 20d": f"{dev:+.1f}%" if (dev is not None and r.get("data_ok")) else "—",
         })
     snapshot["tab2_rows"] = tab2_rows
 

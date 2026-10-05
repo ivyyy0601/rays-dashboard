@@ -9,7 +9,6 @@ lxml
 openpyxl
 xlrd
 akshare>=1.18
-baostock
 tushare
 streamlit-autorefresh
 playwright

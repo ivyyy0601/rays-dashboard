@@ -1,12 +1,14 @@
 """
-Pre-fetch all breadth data and save to a JSON cache file.
+Daily data refresh (run by run_daily.py — systemd rays-daily.timer, 08:00 Hong Kong time):
+  1. index snapshot — Tab 2 (close / RSI / volume / turnover) and Tab 3
+     breadth, from one download of every index's constituents
+     → data/index_snapshot.json, data/breadth_cache.json
+  2. put/call history, Barchart chart
 
-Run this daily via cron / launchd / Task Scheduler. The dashboard reads from
-the cache file on every page load — no manual button click needed.
+The dashboard reads these files on every page load — no manual button click needed.
 
 Usage:  python update_cache.py
 """
-import json
 import logging
 import sys
 import types
@@ -32,14 +34,12 @@ fake_st.warning = fake_st.info = fake_st.error = lambda *a, **k: None
 sys.modules["streamlit"] = fake_st
 
 # Now we can import dashboard modules
-import config
 import data
-import indicators
+import index_snapshot
 
 ET = ZoneInfo("America/New_York")
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
-CACHE_FILE = DATA_DIR / "breadth_cache.json"
 PUTCALL_HISTORY = DATA_DIR / "putcall_history.csv"
 
 logging.disable(logging.CRITICAL)
@@ -78,54 +78,13 @@ def main():
     started = datetime.now(ET)
     print(f"[{started.strftime('%Y-%m-%d %H:%M:%S ET')}] Starting cache update...")
 
-    rows = []
-    for name in config.INDICES:
-        print(f"  Processing {name}...", flush=True)
-        fetcher = data.CONSTITUENT_FETCHERS.get(name)
-        if fetcher is None:
-            print(f"    skipped (no constituent fetcher)")
-            continue
-        tickers = fetcher()
-        if not tickers:
-            print(f"    failed to fetch tickers")
-            continue
-        closes = data.fetch_batch_close(tickers, days=500)
-        br = indicators.breadth_above_both_ma(closes, config.MA_SHORT, config.MA_LONG)
-        ad = indicators.daily_advance_decline(closes)
-        ad_history = indicators.daily_advance_decline_history(closes, days=30)
-        as_of = closes.index[-1].strftime("%Y-%m-%d") if not closes.empty else None
-
-        # Real trading VOLUME (no ETF) — computed here so the heavy constituent
-        # sums (e.g. Topix ~1,541 names) run in the cron, not on page load.
-        def _f(x):
-            return float(x) if x == x and x is not None else None  # NaN/None → None for JSON
-        try:
-            vsum = data.fetch_index_volume_summary(name, config.TURNOVER_AVG_WINDOW)
-        except Exception as e:
-            print(f"    volume failed: {e}")
-            vsum = {}
-
-        rows.append({
-            "Index": name,
-            "as_of": as_of,
-            "pct_above_short": _f(br["pct_above_short"]),
-            "pct_above_long":  _f(br["pct_above_long"]),
-            "pct_above_both":  _f(br["pct_above_both"]),
-            "pct_below_both":  _f(br["pct_below_both"]),
-            "pct_up":          _f(ad["pct_up"]),
-            "pct_down":        _f(ad["pct_down"]),
-            "n_stocks": int(br["n_stocks"]),
-            "ad_history": ad_history,  # list of {date, pct_up, pct_down, net} for last 30 days
-            # Real volume (no ETF) — read by Tab 2
-            "volume_latest": _f(vsum.get("latest")),
-            "volume_avg20":  _f(vsum.get("avg20")),
-            "volume_dev":    _f(vsum.get("deviation_pct")),
-            "volume_source": vsum.get("source"),
-            "volume_unit":   vsum.get("unit"),
-        })
-        _vd = vsum.get("deviation_pct")
-        _vinfo = f"{vsum.get('source')} Δ{_vd:+.1f}%" if _vd == _vd and _vd is not None else "—"
-        print(f"    n={br['n_stocks']}, above_both={br['pct_above_both']:.1f}%, as_of={as_of}, vol={_vinfo}")
+    # One pass over every index's constituents: Tab 2 (close / RSI / volume /
+    # turnover) and Tab 3 (breadth) come from the same lists and downloads.
+    print("Building index snapshot (Tab 2 + Tab 3 breadth)...")
+    try:
+        index_snapshot.save_breadth_cache(index_snapshot.build_and_save())
+    except Exception as e:
+        print(f"  ⚠️ index snapshot failed — Tab 2/3 keep the previous data: {e}")
 
     print("\nUpdating Put/Call history...")
     update_putcall_history()
@@ -143,15 +102,7 @@ def main():
     except Exception as e:
         print(f"  ⚠️ Barchart capture exception: {e}")
 
-    finished = datetime.now(ET)
-    output = {
-        "computed_at_et": finished.isoformat(),
-        "duration_seconds": (finished - started).total_seconds(),
-        "rows": rows,
-    }
-    CACHE_FILE.write_text(json.dumps(output, indent=2, default=str))
-    print(f"\n✓ Saved {len(rows)} rows to {CACHE_FILE}")
-    print(f"✓ Duration: {output['duration_seconds']:.1f} seconds")
+    print(f"\n✓ Duration: {(datetime.now(ET) - started).total_seconds():.1f} seconds")
 
 
 if __name__ == "__main__":

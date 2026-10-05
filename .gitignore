@@ -21,3 +21,9 @@ venv/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Server-generated data / backups
+data/barchart_pc.json
+*.before-*
+pre-data-fix-*/
+data/index_snapshot.json

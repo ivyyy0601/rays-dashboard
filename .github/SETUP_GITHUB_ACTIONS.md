@@ -70,7 +70,7 @@ GitHub Actions 介入后:
     周四 11:30 ET  →  抓 AAII  →  scp 推 Hetzner
     工作日 19:00 ET → 抓 Barchart → scp 推 Hetzner
   Hetzner:
-    19:40 ET cron 跑 → 用最新 AAII + Barchart
-    20:00 ET 邮件
+    每天香港时间 08:00 跑 → 用最新 AAII + Barchart
+    约 08:15 HKT 发邮件
   你: 完全不用管 ✅
 ```

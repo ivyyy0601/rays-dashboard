@@ -1,217 +1,127 @@
-# Hetzner 部署手册
+# 情绪看板：部署与运维
 
-完整部署 = **3 阶段, 30 分钟**:
-1. 注册 Hetzner + 开服务器 (10 分钟)
-2. 服务器初始化 (10 分钟)
-3. 上传代码 + 启动 (10 分钟)
+线上地址：**http://91.98.37.33/sentiment/**
 
----
+| 项 | 值 |
+|---|---|
+| 服务器目录 | `/opt/rays`（属主 `rays` 用户） |
+| systemd 服务 | `streamlit`，监听 `127.0.0.1:8501`，路径前缀 `/sentiment` |
+| 反向代理 | nginx `/sentiment/`，配置在 `final/server/nginx.conf`（和 ETF 看板共用） |
+| 定时任务 | systemd `rays-daily.timer`，每天**香港时间 08:00** 运行 `run_daily.py`（固定按香港时间，不受美国夏令时影响） |
+| 外部数据同步 | GitHub Actions `.github/workflows/sync_aaii_barchart.yml` |
+| Python | `/opt/rays/venv` |
 
-## 阶段 1: 注册 Hetzner + 开服务器 (10 分钟)
+## 本文件夹里的文件
 
-### 1.1 注册账号
-1. 打开 https://accounts.hetzner.com/signUp
-2. 用邮箱注册 (需要信用卡, 但只在月底扣)
-
-### 1.2 创建项目
-1. 登录 Hetzner Cloud Console: https://console.hetzner.cloud/
-2. 点击 "+ New project", 名字填 "Rays Dashboard"
-
-### 1.3 创建服务器
-1. 在项目里点 "+ Add Server"
-2. **Location**: 选 **Ashburn, VA (USA)** (离美股交易所最近, 拉数据快)
-3. **Image**: Ubuntu 22.04
-4. **Type**: 选 **CX22** (€4.51/月, 2vCPU, 4GB RAM, 40GB SSD)
-   - 不要选 CX11, 内存太小 Playwright 跑不动
-5. **Networking**: 默认 IPv4 + IPv6
-6. **SSH Keys**: 见下面的 1.4 步
-7. **Name**: "rays-dashboard"
-8. 点 "Create & Buy now"
-
-### 1.4 添加 SSH Key (重要!)
-**在你 Mac 终端**:
-```bash
-# 看是否已有 SSH key
-ls ~/.ssh/id_*.pub
-
-# 如果没有, 创建一个 (一直按回车跳过密码)
-ssh-keygen -t ed25519
-
-# 复制 public key
-cat ~/.ssh/id_ed25519.pub
-# 复制全部输出 (从 ssh-ed25519 开头)
-```
-
-回到 Hetzner 创建服务器页面:
-- 点 "Add SSH Key"
-- 粘贴你的 public key
-- 名字写 "Mac"
-- 保存
-
-### 1.5 拿到服务器 IP
-服务器创建后显示 IP, 比如 `5.78.xxx.xxx`. 记下来.
-
-测试 SSH (在 Mac 终端):
-```bash
-ssh root@5.78.xxx.xxx
-# 第一次会问 yes/no, 输 yes
-# 应该直接进入服务器 (不用密码, 因为有 SSH key)
-```
-
-如果连接成功, 你会看到 Ubuntu 欢迎信息. 输 `exit` 退出.
+| 文件 | 对应服务器上的位置 | 用途 |
+|---|---|---|
+| `streamlit.service` | `/etc/systemd/system/streamlit.service` | 常驻运行 Streamlit |
+| `rays-daily.service` | `/etc/systemd/system/` | 每日数据更新 + 提醒邮件（跑一次就结束） |
+| `rays-daily.timer` | `/etc/systemd/system/` | 每天 08:00 HKT 触发上面的服务 |
+| `setup_server.sh` | — | **全新服务器**第一次初始化（装系统包、建 `rays` 用户、开防火墙） |
+| `finalize.sh` | — | 代码上传后：装依赖、装 systemd 服务和每日定时器 |
 
 ---
 
-## 阶段 2: 服务器初始化 (10 分钟)
+## 日常：修改代码后上线
 
-**在 Mac 终端跑:**
+在 `final/` 目录下运行。先预览会上传哪些文件：
 
-### 2.1 上传 setup_server.sh 到服务器
 ```bash
-cd /Users/chenjiexin/Desktop/rays
-scp deploy/setup_server.sh root@YOUR_IP:/root/
+bash server/deploy.sh sentiment --dry-run
 ```
 
-### 2.2 SSH 进服务器跑初始化
+确认后正式部署（会自动备份并重启服务）：
+
 ```bash
-ssh root@YOUR_IP
-bash /root/setup_server.sh
+bash server/deploy.sh sentiment
 ```
 
-这会自动:
-- 装 Python 3.11, nginx, cron, Playwright 系统依赖
-- 设时区为 America/New_York
-- 创建 `rays` 用户和 `/opt/rays` 目录
-- 配置防火墙 (开放 22/80/443)
+只会上传代码。服务器上的 `data/` 目录和三个密钥文件（`anthropic_key.json`、`email_config.json`、`tushare_token.json`）不会被覆盖。
 
-跑完会显示 `✓ Server base setup complete!`. 不要关 SSH.
+## 每日数据流程
+
+```
+08:00 HKT  rays-daily.timer ─► run_daily.py
+                   ├─ update_cache.py   指数快照：一次下载所有成分股，同时算出
+                   │                      Tab 2 收盘价 / RSI / 成交量 / 成交额 → data/index_snapshot.json
+                   │                      Tab 3 均线 Breadth / 涨跌家数        → data/breadth_cache.json
+                   │                      Tab 1 VIX / GLD 日线                → data/market_series.json
+                   │                    每个指数都用「最近一个完成的交易日」；
+                   │                    08:00 HKT 正在交易的市场（东京、首尔）用前一个交易日
+                   │                    记录 Put/Call 历史               → data/putcall_history.csv
+                   └─ check_alerts.py   检查提醒条件 + Claude 生成每日简报 → 发邮件
+
+GitHub Actions（服务器 IP 会被 AAII、Barchart 屏蔽，所以在 GitHub 上抓再推过来）
+  周四 15:30 UTC        AAII 情绪 .xls     → /opt/rays/data/aaii_sentiment.xls
+  周一到周五 23:00 UTC   Barchart $SPX P/C → /opt/rays/data/barchart_pc.json
+  任何一步失败都会发邮件通知
+```
+
+GitHub Actions 需要在仓库 Settings → Secrets 里配置 `SSH_PRIVATE_KEY` 和 `SERVER_IP`。
+
+页面**只读这些文件，不会在打开时去外部抓数据**（没有 Refresh 按钮），所以打开很快、所有人看到的数字一样。
+需要手动重跑时，在服务器上运行 `systemctl start rays-daily`（约 15 分钟，跑完会发邮件）。
 
 ---
 
-## 阶段 3: 上传代码 + 启动 (10 分钟)
+## 常用命令（在服务器上运行）
 
-### 3.1 在 Mac 终端 (开一个新终端窗口) 上传代码:
 ```bash
-cd /Users/chenjiexin/Desktop/rays
-bash deploy/upload_to_server.sh root@YOUR_IP
+systemctl status streamlit                    # 服务状态
+systemctl restart streamlit                   # 重启
+tail -f /opt/rays/data/streamlit.log          # Streamlit 日志
+tail -f /opt/rays/data/cron.log               # 每日任务日志
+systemctl list-timers rays-daily.timer        # 下一次什么时候跑
+
+# 立刻手动跑一次每日流程（约 15 分钟，跑完会发邮件）
+systemctl start rays-daily
+
+# 只测试提醒邮件
+sudo -u rays /opt/rays/venv/bin/python /opt/rays/check_alerts.py
 ```
-
-这会 rsync 上传所有代码 (包括你的 email_config.json + tushare_token.json).
-
-### 3.2 在服务器 SSH 窗口跑 finalize:
-```bash
-bash /opt/rays/deploy/finalize.sh
-```
-
-这会:
-- 装 Python 依赖 (yfinance, akshare, baostock, playwright, etc.)
-- 下载 Chromium (Playwright 用)
-- 创建 systemd 服务让 streamlit 后台跑
-- 配置 nginx 反向代理 (80 端口转发到 Streamlit 8501)
-- 安装每天 19:40 NY 时间的 cron
-
-跑完显示 `✓ Deployment complete!`.
-
-### 3.3 浏览器打开 dashboard
-在你的浏览器打开:
-```
-http://YOUR_IP/
-```
-
-应该看到 Rays Dashboard! 🎉
-
-### 3.4 立刻跑一次完整数据更新 (测试)
-```bash
-sudo -u rays /opt/rays/venv/bin/python /opt/rays/run_daily.py
-```
-
-跑 ~15 分钟, 完成后会发邮件给你.
-
----
-
-## 验证 / 监控
-
-### 看服务状态
-```bash
-systemctl status streamlit
-# 应该看到 "active (running)"
-```
-
-### 看 streamlit 日志
-```bash
-tail -f /opt/rays/data/streamlit.log
-```
-
-### 看 cron 配置
-```bash
-sudo -u rays crontab -l
-# 应该看到: 40 19 * * * /opt/rays/venv/bin/python /opt/rays/run_daily.py ...
-```
-
-### 看 cron 跑过的日志
-```bash
-tail -f /opt/rays/data/cron.log
-```
-
-### 重启 streamlit
-```bash
-systemctl restart streamlit
-```
-
----
-
-## 关闭你的 Mac
-
-部署成功后, **你的 Mac 可以彻底关机**——服务器会自己跑.
-
-Hetzner 服务器 24/7 在线, 每天 NY 时间 19:40 自动跑数据, 19:55 发邮件.
-
----
-
-## 监控价钱
-
-Hetzner CX22 是 **€4.51/月** = ~¥35/月.
-
-按月底结算, 第一个月是按使用天数计费 (开 10 天就只扣 1/3).
-
----
-
-## 加域名 (可选)
-
-如果想用 `dashboard.your-domain.com` 访问, 不是 IP:
-1. 买一个域名 (Cloudflare $9/年)
-2. 在 DNS 加 A 记录指向服务器 IP
-3. 改 nginx.conf 把 `server_name _;` 改成 `server_name dashboard.your-domain.com;`
-4. 装 certbot 加 HTTPS:
-```bash
-apt install certbot python3-certbot-nginx
-certbot --nginx -d dashboard.your-domain.com
-```
-5. 完成. 现在 https://dashboard.your-domain.com 能访问.
-
----
 
 ## 故障排查
 
-**streamlit 没起来:**
-```bash
-journalctl -u streamlit --no-pager -n 50
-```
+| 现象 | 检查 |
+|---|---|
+| 页面打不开 / 502 | `systemctl status streamlit`，然后 `journalctl -u streamlit -n 50` |
+| 页面能开但资源 404、一直转圈 | `streamlit.service` 里有没有 `--server.baseUrlPath sentiment`；nginx 的 `location /sentiment/` 有没有配 WebSocket 头 |
+| 数据不更新 | `tail /opt/rays/data/cron.log`；`ls -l /opt/rays/data/` 看文件修改时间 |
+| AAII / Put-Call 过期 | 去 GitHub 仓库的 Actions 页面看最近一次运行结果 |
+| RSI & Volume 表出现 ⚠️ | 展开表下方「Data notes & sources」看原因；手动重建：`sudo -u rays /opt/rays/venv/bin/python /opt/rays/index_snapshot.py` |
+| AI 侧栏不能用 | `/opt/rays/anthropic_key.json` 是否存在、key 是否有效 |
 
-**数据没更新:**
-```bash
-cat /opt/rays/data/cron.log
-```
+---
 
-**邮件没发:**
-```bash
-sudo -u rays /opt/rays/venv/bin/python /opt/rays/check_alerts.py
-# 看输出里有没有 "Email sent" 或错误
-```
+## 从零搭建（新服务器）
 
-**端口 80 不通:**
-```bash
-ufw status
-nginx -t
-systemctl status nginx
-```
+只有换服务器时才需要。
+
+1. 在 Hetzner 开一台 Ubuntu 机器，添加你 Mac 的 SSH 公钥（`~/.ssh/id_ed25519.pub`）。
+2. 上传并运行初始化脚本：
+   ```bash
+   scp deploy/setup_server.sh root@<IP>:/root/
+   ```
+   ```bash
+   ssh root@<IP> 'bash /root/setup_server.sh'
+   ```
+3. 把 `final/server/common.sh` 里的 `SERVER` 改成新 IP（或者运行前设置 `SERVER=root@<IP>`），然后在 `final/` 下上传代码：
+   ```bash
+   bash server/deploy.sh sentiment
+   ```
+   第一次部署时服务还不存在，脚本最后一步重启会报错，这是正常的。
+4. 手动上传密钥文件（deploy 脚本不会传密钥）：
+   ```bash
+   scp anthropic_key.json email_config.json tushare_token.json root@<IP>:/opt/rays/
+   ```
+5. 装依赖、systemd 服务和每日定时器：
+   ```bash
+   ssh root@<IP> 'bash /opt/rays/deploy/finalize.sh'
+   ```
+6. 安装 nginx 配置（见 `final/README.md` 的「修改 nginx 配置」一节）。
+7. 生成第一份缓存：
+   ```bash
+   ssh root@<IP> 'sudo -u rays /opt/rays/venv/bin/python /opt/rays/update_cache.py'
+   ```
+8. 更新 GitHub 仓库 Secrets 里的 `SERVER_IP`。

@@ -20,22 +20,118 @@ warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
 
 # ---------- Price history ----------
 
-@st.cache_data(ttl=90000, show_spinner=False)  # 25 hours — daily cron
-def fetch_yf_history(ticker: str, days: int = 500) -> pd.DataFrame:
-    end = datetime.now()
-    start = end - timedelta(days=days)
-    df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    # Drop rows where Close is NaN (e.g., today's row when market hasn't closed yet)
-    if "Close" in df.columns:
-        df = df.dropna(subset=["Close"])
-    # Fallback: yfinance is unreliable for some Chinese index tickers — use akshare
-    if len(df) < 50 and ticker in ("000300.SS", "399006.SZ", "000852.SS", "^HSI"):
-        df_alt = _fetch_index_via_akshare(ticker, days)
-        if len(df_alt) > len(df):
-            return df_alt
-    return df
+AKSHARE_ONLY_INDICES = {"000300.SS": "sh000300", "000852.SS": "sh000852", "399006.SZ": "sz399006"}
+
+
+def akshare_index_source(ticker: str) -> str:
+    return f"Sina via AkShare ({AKSHARE_ONLY_INDICES[ticker]})"
+
+
+def completed_daily_rows(frame, name: str, now=None):
+    """Exclude the current local-market session until close plus 30 minutes.
+
+    Dates come from the feed; this is a conservative regular-session cutoff,
+    not a replacement for an exchange calendar or a feed-finality guarantee.
+    """
+    markets = {
+        "Hang Seng": ("Asia/Hong_Kong", 16, 30),
+        "CSI 300": ("Asia/Shanghai", 15, 30),
+        "CSI 1000": ("Asia/Shanghai", 15, 30),
+        "ChiNext": ("Asia/Shanghai", 15, 30),
+        "Nikkei 225": ("Asia/Tokyo", 16, 0),
+        "Topix": ("Asia/Tokyo", 16, 0),
+        "Taiwan": ("Asia/Taipei", 14, 0),
+        "KOSPI 200": ("Asia/Seoul", 16, 0),
+    }
+    zone, hour, minute = markets.get(name, ("America/New_York", 16, 30))
+    current = pd.Timestamp.now(tz=zone) if now is None else pd.Timestamp(now).tz_convert(zone)
+    cutoff = current.normalize() + pd.Timedelta(hours=hour, minutes=minute)
+    idx = pd.DatetimeIndex(frame.index)
+    dates = (idx.tz_convert(zone) if idx.tz is not None else idx).date
+    mask = (dates < current.date()) | ((dates == current.date()) & (current >= cutoff))
+    return frame.loc[mask].copy()
+
+MARKET_SERIES_FILE = Path(__file__).parent / "data" / "market_series.json"
+
+
+def load_market_series(ticker: str) -> pd.DataFrame:
+    """Daily closes for VIX / GLD written by the daily run (index_snapshot.py) —
+    latest completed US session. DataFrame[Close], empty if not available."""
+    try:
+        version = MARKET_SERIES_FILE.stat().st_mtime_ns
+    except FileNotFoundError:
+        return pd.DataFrame()
+    return _load_market_series_cached(ticker, version)
+
+
+@st.cache_data(show_spinner=False)
+def _load_market_series_cached(ticker: str, file_version) -> pd.DataFrame:
+    import json
+    s = json.loads(MARKET_SERIES_FILE.read_text())["series"].get(ticker)
+    if not s:
+        return pd.DataFrame()
+    return pd.DataFrame({"Close": s["close"]}, index=pd.DatetimeIndex(pd.to_datetime(s["dates"])))
+
+
+def _parse_topix_snapshot(payload, now=None, symbol="TSE:TOPIX", market="Topix", zone="Asia/Tokyo"):
+    """Validate a daily index snapshot. Never invent history or observation dates."""
+    import math
+    entries = payload.get("data", [])
+    if len(entries) != 1 or entries[0].get("s") != symbol:
+        raise ValueError(f"Missing {symbol} index")
+    name, description, kind, close, rsi, timestamp, prev_close, prev_rsi = entries[0]["d"]
+    if name != symbol.split(":")[1] or kind != "index":
+        raise ValueError(f"Not the {symbol} index")
+    close, rsi = float(close), float(rsi)
+    if not math.isfinite(close) or close <= 0 or not math.isfinite(rsi) or not 0 <= rsi <= 100:
+        raise ValueError("Invalid close or RSI")
+    observation = pd.to_datetime(timestamp, unit="s", utc=True)
+    if pd.isna(observation):
+        raise ValueError("Missing observation date")
+    day = observation.tz_convert(zone).normalize().tz_localize(None)
+    frame = pd.DataFrame({"Close": [close], "RSI14": [rsi]}, index=pd.DatetimeIndex([day], name="Date"))
+    frame = completed_daily_rows(frame, market, now=now)
+    frame.attrs["history_source"] = f"TradingView {symbol} (daily index snapshot)"
+    if frame.empty:
+        # The session is still trading: its close/RSI are live, not final. Hand
+        # back the previous (completed) session's values instead — TradingView's
+        # close[1] / RSI[1]. The caller dates them (TradingView gives no date).
+        try:
+            pc, pr = float(prev_close), float(prev_rsi)
+            if math.isfinite(pc) and pc > 0 and math.isfinite(pr) and 0 <= pr <= 100:
+                frame.attrs["previous_session"] = {"close": pc, "rsi": pr,
+                                                   "trading_day": day.strftime("%Y-%m-%d")}
+        except (TypeError, ValueError):
+            pass
+    return frame
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_kospi_snapshot():
+    try:
+        response = requests.post("https://scanner.tradingview.com/korea/scan", json={
+            "symbols": {"tickers": ["KRX:KOSPI200"], "query": {"types": []}},
+            "columns": ["name", "description", "type", "close", "RSI", "time", "close[1]", "RSI[1]"],
+        }, timeout=20)
+        response.raise_for_status()
+        return _parse_topix_snapshot(response.json(), symbol="KRX:KOSPI200", market="KOSPI 200", zone="Asia/Seoul")
+    except (requests.RequestException, ValueError, TypeError, KeyError, IndexError):
+        logging.getLogger(__name__).warning("KOSPI 200 index snapshot unavailable; no proxy fallback")
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_topix_snapshot():
+    try:
+        response = requests.post("https://scanner.tradingview.com/japan/scan", json={
+            "symbols": {"tickers": ["TSE:TOPIX"], "query": {"types": []}},
+            "columns": ["name", "description", "type", "close", "RSI", "time", "close[1]", "RSI[1]"],
+        }, timeout=20)
+        response.raise_for_status()
+        return _parse_topix_snapshot(response.json())
+    except (requests.RequestException, ValueError, TypeError, KeyError, IndexError):
+        logging.getLogger(__name__).warning("TOPIX index snapshot unavailable; ETF fallback disabled")
+        return pd.DataFrame()
 
 
 def _fetch_index_via_akshare(ticker: str, days: int) -> pd.DataFrame:
@@ -69,7 +165,12 @@ def _fetch_index_via_akshare(ticker: str, days: int) -> pd.DataFrame:
             df["Volume"] = 0
         # Trim to requested days
         cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
-        return df[df.index >= cutoff][["Open", "High", "Low", "Close", "Volume"]]
+        result = df[df.index >= cutoff][["Open", "High", "Low", "Close", "Volume"]].copy()
+        result.attrs["history_source"] = (
+            akshare_index_source(ticker) if ticker in AKSHARE_ONLY_INDICES
+            else "Eastmoney via AkShare (HSI)"
+        )
+        return result
     except Exception:
         return pd.DataFrame()
 
@@ -110,407 +211,48 @@ def fetch_tv_rsi(name: str) -> float:
     return None
 
 
-@st.cache_data(ttl=3600, show_spinner="Downloading constituents...")
-def fetch_batch_close(tickers: list, days: int = 300) -> pd.DataFrame:
-    """Returns a DataFrame of close prices: rows=dates, cols=tickers.
-
-    Routes A-share tickers (.SS / .SZ) to akshare per-stock; everything else
-    goes through yfinance batch download.
-    """
-    if not tickers:
-        return pd.DataFrame()
-    a_share = [t for t in tickers if t.endswith(".SS") or t.endswith(".SZ")]
-    other = [t for t in tickers if not (t.endswith(".SS") or t.endswith(".SZ"))]
-
-    frames = []  # list of single-column DataFrames or Series, then concat once
-
-    # Path 1: yfinance batch for US / HK / TW / KR
-    if other:
-        ydf = _yf_batch_close(other, days)
-        if not ydf.empty:
-            frames.append(ydf)
-
-    # Path 2: A-share — akshare/Baostock first (best when run inside China);
-    # if that yields little (e.g. those hosts are blocked from a US server),
-    # fall back to yfinance, which serves A-shares under the same .SS/.SZ codes.
-    if a_share:
-        ashare_df = _fetch_ashare_close(a_share, days)
-        got = set(ashare_df.columns) if not ashare_df.empty else set()
-        if len(got) < 0.5 * len(a_share):
-            missing = [s for s in a_share if s not in got]
-            yf_ashare = _yf_batch_close(missing, days)
-            ashare_df = pd.concat([ashare_df, yf_ashare], axis=1) if not ashare_df.empty else yf_ashare
-        if not ashare_df.empty:
-            frames.append(ashare_df)
-
-    if not frames:
-        return pd.DataFrame()
-    closes = pd.concat(frames, axis=1)
-    return closes.dropna(how="all")
+# Yahoo daily bars for every index constituent, downloaded once per process by
+# the index snapshot (index_snapshot.py), which derives Tab 2's volume / turnover
+# and Tab 3's breadth from them.
+_YF_DAILY = {}   # ticker -> DataFrame[Close, Volume], naive local dates
 
 
-def _yf_batch_close(tickers: list, days: int) -> pd.DataFrame:
-    """Batch close prices from yfinance (rows=dates, cols=tickers)."""
-    if not tickers:
-        return pd.DataFrame()
-    end = datetime.now()
-    start = end - timedelta(days=days)
-    df = yf.download(tickers, start=start, end=end, progress=False,
-                     auto_adjust=False, group_by="ticker", threads=True)
-    series_dict = {}
-    if isinstance(df.columns, pd.MultiIndex):
-        for t in tickers:
-            try:
-                s = df[t]["Close"]
-                if not s.dropna().empty:
-                    series_dict[t] = s
-            except Exception:
-                continue
-    elif "Close" in df.columns and len(tickers) == 1:
-        series_dict[tickers[0]] = df["Close"]
-    return pd.DataFrame(series_dict) if series_dict else pd.DataFrame()
-
-
-def _fetch_ashare_close_baostock(symbols: list, days: int) -> pd.DataFrame:
-    """Fallback A-share fetcher via Baostock when akshare upstream is down."""
-    try:
-        import baostock as bs
-    except ImportError:
-        return pd.DataFrame()
-    try:
-        bs.login()
-        end_str = datetime.now().strftime("%Y-%m-%d")
-        start_str = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-        series_dict = {}
-        for sym in symbols:
-            code_no_suffix = sym.replace(".SS", "").replace(".SZ", "")
-            # Baostock format: "sh.600000" or "sz.000001"
-            bs_code = ("sh." if sym.endswith(".SS") else "sz.") + code_no_suffix
-            try:
-                rs = bs.query_history_k_data_plus(
-                    bs_code, "date,close",
-                    start_date=start_str, end_date=end_str,
-                    frequency="d", adjustflag="2",  # qfq
-                )
-                if rs.error_code == "0":
-                    df = rs.get_data()
-                    if not df.empty:
-                        df["date"] = pd.to_datetime(df["date"])
-                        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-                        series_dict[sym] = df.set_index("date")["close"]
-            except Exception:
-                continue
-        bs.logout()
-        return pd.DataFrame(series_dict) if series_dict else pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
-
-
-def _akshare_reachable() -> bool:
-    """One quick probe — akshare's upstream (eastmoney) is blocked from non-China
-    IPs. If this one call fails, skip the per-stock retry storm and let the caller
-    fall back to yfinance/Baostock instead."""
-    try:
-        import akshare as ak
-        df = ak.stock_zh_a_hist(symbol="000001", period="daily",
-                                start_date="20260101", end_date="20260110", adjust="")
-        return not df.empty
-    except Exception:
-        return False
-
-
-def _fetch_ashare_close(symbols: list, days: int) -> pd.DataFrame:
-    """Fetch A-share daily close. Try akshare first; fall back to Baostock if too many failures."""
-    try:
-        import akshare as ak
-    except ImportError:
-        return _fetch_ashare_close_baostock(symbols, days)
-    if not _akshare_reachable():
-        # akshare upstream unreachable (e.g. US server) → don't hammer it per-stock;
-        # return empty so fetch_batch_close uses its yfinance fallback.
-        return pd.DataFrame()
-    end_str = datetime.now().strftime("%Y%m%d")
-    start_str = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+def yf_daily(tickers: list, days: int = 500) -> dict:
+    """{ticker: DataFrame[Close, Volume]} for `days` back, including the latest
+    bars (Yahoo's `end` is exclusive, so end = now + 2 days). Downloads only
+    what isn't cached yet, in chunks, and backs off when Yahoo rate-limits."""
     import time
-    series_dict = {}
-    progress = st.progress(0.0, text=f"Fetching {len(symbols)} A-share stocks via akshare...")
-    failures_in_a_row = 0
-    for i, sym in enumerate(symbols):
-        code = sym.replace(".SS", "").replace(".SZ", "")
-        success = False
-        for attempt in range(3):
+    have = {t for t, df in _YF_DAILY.items() if df.attrs.get("days", 0) >= days}
+    missing = [t for t in dict.fromkeys(tickers) if t not in have]
+    start, end = datetime.now() - timedelta(days=days), datetime.now() + timedelta(days=2)
+    for i in range(0, len(missing), 200):
+        todo = missing[i:i + 200]
+        for attempt in range(4):
             try:
-                df = ak.stock_zh_a_hist(symbol=code, period="daily",
-                                        start_date=start_str, end_date=end_str, adjust="qfq")
-                if not df.empty and "日期" in df.columns and "收盘" in df.columns:
-                    df["日期"] = pd.to_datetime(df["日期"])
-                    series_dict[sym] = df.set_index("日期")["收盘"]
-                    success = True
-                    failures_in_a_row = 0
-                    break
+                df = yf.download(todo, start=start, end=end, progress=False, auto_adjust=False,
+                                 group_by="ticker", threads=True)
             except Exception:
-                if attempt < 2:
-                    time.sleep(1.0 * (attempt + 1))
-        if not success:
-            failures_in_a_row += 1
-            # If akshare is fully down (15 consecutive fails) → switch to Baostock for remaining
-            if failures_in_a_row >= 15:
-                remaining = symbols[i:]
-                progress.progress(min(1.0, (i + 1) / len(symbols)),
-                                 text=f"akshare down — switching to Baostock for remaining {len(remaining)} stocks...")
-                bs_data = _fetch_ashare_close_baostock(remaining, days)
-                if not bs_data.empty:
-                    for col in bs_data.columns:
-                        series_dict[col] = bs_data[col]
-                progress.empty()
-                return pd.DataFrame(series_dict) if series_dict else pd.DataFrame()
-        if (i + 1) % 10 == 0 or i == len(symbols) - 1:
-            progress.progress((i + 1) / len(symbols), text=f"A-share: {i+1}/{len(symbols)}")
-    progress.empty()
-
-    # Final fallback: if akshare collected < 30% of symbols, top up with Baostock
-    success_rate = len(series_dict) / len(symbols) if symbols else 0
-    if success_rate < 0.3:
-        missing = [s for s in symbols if s not in series_dict]
-        bs_data = _fetch_ashare_close_baostock(missing, days)
-        if not bs_data.empty:
-            for col in bs_data.columns:
-                series_dict[col] = bs_data[col]
-
-    return pd.DataFrame(series_dict) if series_dict else pd.DataFrame()
-
-
-# ---------- Real turnover (constituent aggregation) ----------
-
-def _fetch_ashare_turnover_baostock(symbols: list, days: int) -> pd.DataFrame:
-    """Fallback A-share turnover (成交额, CNY) via Baostock — used when akshare
-    (eastmoney) is unreachable, e.g. from a non-China server IP."""
-    try:
-        import baostock as bs
-    except ImportError:
-        return pd.DataFrame()
-    try:
-        bs.login()
-        end_str = datetime.now().strftime("%Y-%m-%d")
-        start_str = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-        series_dict = {}
-        for sym in symbols:
-            code = sym.replace(".SS", "").replace(".SZ", "")
-            bs_code = ("sh." if sym.endswith(".SS") else "sz.") + code
-            try:
-                rs = bs.query_history_k_data_plus(
-                    bs_code, "date,amount",
-                    start_date=start_str, end_date=end_str,
-                    frequency="d", adjustflag="3",
-                )
-                if rs.error_code == "0":
-                    df = rs.get_data()
-                    if not df.empty:
-                        df["date"] = pd.to_datetime(df["date"])
-                        df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
-                        series_dict[sym] = df.set_index("date")["amount"]
-            except Exception:
-                continue
-        bs.logout()
-        return pd.DataFrame(series_dict) if series_dict else pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
-
-
-def _fetch_ashare_turnover(symbols: list, days: int) -> pd.DataFrame:
-    """A-share daily turnover (成交额, CNY). Try akshare first; fall back to Baostock."""
-    try:
-        import akshare as ak
-    except ImportError:
-        return _fetch_ashare_turnover_baostock(symbols, days)
-    end_str = datetime.now().strftime("%Y%m%d")
-    start_str = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
-    import time
-    series_dict = {}
-    failures_in_a_row = 0
-    for i, sym in enumerate(symbols):
-        code = sym.replace(".SS", "").replace(".SZ", "")
-        success = False
-        for attempt in range(2):
-            try:
-                df = ak.stock_zh_a_hist(symbol=code, period="daily",
-                                        start_date=start_str, end_date=end_str, adjust="")
-                if not df.empty and "日期" in df.columns and "成交额" in df.columns:
-                    df["日期"] = pd.to_datetime(df["日期"])
-                    series_dict[sym] = pd.to_numeric(df.set_index("日期")["成交额"], errors="coerce")
-                    success = True
-                    failures_in_a_row = 0
-                    break
-            except Exception:
-                if attempt < 1:
-                    time.sleep(0.8)
-        if not success:
-            failures_in_a_row += 1
-            if failures_in_a_row >= 15:  # akshare down → Baostock for the rest
-                bs_data = _fetch_ashare_turnover_baostock(symbols[i:], days)
-                for col in bs_data.columns:
-                    series_dict[col] = bs_data[col]
-                return pd.DataFrame(series_dict) if series_dict else pd.DataFrame()
-    # Top up with Baostock if akshare got too little
-    if symbols and len(series_dict) / len(symbols) < 0.3:
-        missing = [s for s in symbols if s not in series_dict]
-        bs_data = _fetch_ashare_turnover_baostock(missing, days)
-        for col in bs_data.columns:
-            series_dict[col] = bs_data[col]
-    return pd.DataFrame(series_dict) if series_dict else pd.DataFrame()
-
-
-@st.cache_data(ttl=90000, show_spinner=False)  # 25 hours — refreshed by daily cron
-def fetch_batch_turnover(tickers: list, days: int = 45) -> pd.DataFrame:
-    """Daily turnover per ticker (rows=dates, cols=tickers), native currency.
-
-    Non-A-share = Close × Volume via one batched yfinance call;
-    A-share = 成交额 (real turnover field) via akshare, Baostock fallback.
-    Summed across constituents, this gives an index's real market turnover.
-    """
-    if not tickers:
-        return pd.DataFrame()
-    a_share = [t for t in tickers if t.endswith(".SS") or t.endswith(".SZ")]
-    other = [t for t in tickers if not (t.endswith(".SS") or t.endswith(".SZ"))]
-    frames = []
-
-    if other:
-        end = datetime.now()
-        start = end - timedelta(days=days)
-        df = yf.download(other, start=start, end=end, progress=False,
-                         auto_adjust=False, group_by="ticker", threads=True)
-        series_dict = {}
-        if isinstance(df.columns, pd.MultiIndex):
-            for t in other:
+                df = pd.DataFrame()
+            for t in todo:
                 try:
-                    sub = df[t]
-                    to = (sub["Close"] * sub["Volume"]).dropna()
-                    if not to.empty:
-                        series_dict[t] = to
+                    x = df[t] if isinstance(df.columns, pd.MultiIndex) else df
+                    x = x[["Close", "Volume"]].dropna(subset=["Close"])
                 except Exception:
                     continue
-        elif "Close" in df.columns and "Volume" in df.columns and len(other) == 1:
-            to = (df["Close"] * df["Volume"]).dropna()
-            if not to.empty:
-                series_dict[other[0]] = to
-        if series_dict:
-            frames.append(pd.DataFrame(series_dict))
-
-    if a_share:
-        adf = _fetch_ashare_turnover(a_share, days)
-        if not adf.empty:
-            frames.append(adf)
-
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, axis=1).dropna(how="all")
-
-
-def index_turnover_summary(name: str, days: int = 45, window: int = 20) -> dict:
-    """Real index turnover = Σ(constituent daily turnover), plus its Δ vs prior
-    `window`-day average. Returns {} if the constituent list is unavailable or
-    no turnover data could be fetched (caller then falls back to the ETF proxy).
-    """
-    import indicators
-    fetcher = CONSTITUENT_FETCHERS.get(name)
-    if fetcher is None:
-        return {}
-    tickers = fetcher()
-    if not tickers:
-        return {}
-    tdf = fetch_batch_turnover(tickers, days=days)
-    if tdf.empty:
-        return {}
-    # Total index turnover per day = sum across constituents that traded that day.
-    daily = tdf.sum(axis=1, min_count=1).dropna()
-    summ = indicators.turnover_series_summary(daily, window)
-    if not (summ["latest"] == summ["latest"]):  # NaN guard
-        return {}
-    return {
-        "latest": summ["latest"],
-        "avg20": summ["avg20"],
-        "deviation_pct": summ["deviation_pct"],
-        "n_constituents": int(tdf.shape[1]),
-        "as_of": daily.index[-1].strftime("%Y-%m-%d"),
-    }
-
-
-# ---------- Real trading volume (no ETF) ----------
-
-@st.cache_data(ttl=90000, show_spinner=False)  # 25 hours — daily cron
-def fetch_constituent_volume_series(name: str, days: int = 90) -> pd.Series:
-    """Index trading volume = Σ of its constituents' share volume — used when the
-    index ticker has no usable own volume and we want to stay ETF-free:
-      - SOX   (^SOX reports no volume)
-      - Topix (its yfinance ticker 1308.T is an ETF, not the real index)
-    Returns an empty Series if the constituent fetch fails."""
-    fetcher = CONSTITUENT_FETCHERS.get(name)
-    tickers = fetcher() if fetcher else []
-    if not tickers:
-        return pd.Series(dtype=float)
-    end = datetime.now()
-    start = end - timedelta(days=days)
-    df = yf.download(tickers, start=start, end=end, progress=False,
-                     auto_adjust=False, group_by="ticker", threads=True)
-    vols = {}
-    if isinstance(df.columns, pd.MultiIndex):
-        for t in tickers:
-            try:
-                v = df[t]["Volume"].dropna()
-                if not v.empty:
-                    vols[t] = v
-            except Exception:
-                continue
-    elif "Volume" in df.columns and len(tickers) == 1:
-        vols[tickers[0]] = df["Volume"].dropna()
-    if not vols:
-        return pd.Series(dtype=float)
-    return pd.DataFrame(vols).sum(axis=1, min_count=1).dropna()
-
-
-def fetch_index_volume_summary(name: str, window: int = 20) -> dict:
-    """Real index trading VOLUME (no ETF) + its Δ vs the prior `window` average.
-
-    Source per index:
-      - Russell 2000 → RTY=F futures contract volume (^RUT volume is a yfinance bug)
-      - SOX          → Σ of 30 constituents' share volume (^SOX reports no volume)
-      - all others   → the index ticker's own aggregate share volume (direct)
-
-    Drops incomplete trailing bars and excludes today from the baseline (via
-    indicators.turnover_series_summary). Returns {} if no usable volume series.
-    """
-    import indicators
-    days = config.HISTORY_DAYS
-    if name == "Russell 2000":
-        df = fetch_yf_history("RTY=F", days=days)
-        ser = df["Volume"] if (not df.empty and "Volume" in df.columns) else None
-        unit, source = "contracts", "RTY=F futures"
-    elif name in ("SOX", "Topix"):
-        # ^SOX has no volume; Topix's 1308.T ticker is an ETF — sum constituents instead.
-        ser = fetch_constituent_volume_series(name, days=90)
-        n = len(CONSTITUENT_FETCHERS[name]()) if CONSTITUENT_FETCHERS.get(name) else 0
-        unit, source = "shares", f"Σ{n} constituents"
-    else:
-        conf = config.INDICES.get(name, {})
-        df = fetch_yf_history(conf.get("index", ""), days=days)
-        ser = df["Volume"] if (not df.empty and "Volume" in df.columns) else None
-        unit, source = "shares", f"Index {conf.get('index', '')}"
-    if ser is None or len(ser) == 0:
-        return {}
-    s = ser.replace(0, pd.NA).dropna()
-    if len(s) < 3:
-        return {}
-    summ = indicators.turnover_series_summary(s, window)
-    if not (summ["latest"] == summ["latest"]):  # NaN guard
-        return {}
-    return {
-        "latest": summ["latest"],
-        "avg20": summ["avg20"],
-        "deviation_pct": summ["deviation_pct"],
-        "unit": unit,
-        "source": source,
-        "as_of": s.index[-1].strftime("%Y-%m-%d"),
-    }
+                if x.empty:
+                    continue
+                idx = pd.DatetimeIndex(x.index)
+                x.index = (idx.tz_localize(None) if idx.tz is not None else idx).normalize()
+                x = x[~x.index.duplicated(keep="last")]
+                x.attrs["days"] = days
+                _YF_DAILY[t] = x
+            todo = [t for t in todo if t not in _YF_DAILY]
+            # A few names are always missing (delisted); many missing = rate limit
+            if len(todo) <= 0.05 * 200 or attempt == 3:
+                break
+            time.sleep(30 * (attempt + 1))
+        time.sleep(1)
+    return {t: _YF_DAILY[t] for t in tickers if t in _YF_DAILY}
 
 
 # ---------- Constituents ----------
@@ -519,6 +261,11 @@ _WIKI_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                   "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
 }
+
+# Which source each constituent fetcher actually used on its last call. A value
+# containing "fallback" means the primary (official / ETF) source failed — the
+# index snapshot flags that, since a fallback list can be stale.
+CONSTITUENT_SOURCE = {}
 
 
 def _wiki_tables(url: str) -> list:
@@ -530,8 +277,24 @@ def _wiki_tables(url: str) -> list:
 
 @st.cache_data(ttl=86400)
 def constituents_sp500() -> list:
+    """S&P 500 constituents from SPY's daily holdings file (State Street);
+    Wikipedia as fallback. The ETF must track index changes, so its holdings
+    follow every rebalance."""
+    try:
+        r = requests.get("https://www.ssga.com/us/en/intermediary/library-content/products/"
+                         "fund-data/etfs/us/holdings-daily-us-en-spy.xlsx",
+                         headers=_WIKI_HEADERS, timeout=30)
+        df = pd.read_excel(io.BytesIO(r.content), skiprows=4)
+        tickers = [t.replace(".", "-") for t in df["Ticker"].dropna().astype(str)
+                   if t.replace(".", "").isalpha()]
+        if len(tickers) >= 490:
+            CONSTITUENT_SOURCE["S&P 500"] = "SSGA SPY holdings"
+            return tickers
+    except Exception:
+        pass
     try:
         tables = _wiki_tables("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        CONSTITUENT_SOURCE["S&P 500"] = "Wikipedia (fallback)"
         return tables[0]["Symbol"].astype(str).str.replace(".", "-", regex=False).tolist()
     except Exception:
         return []
@@ -539,8 +302,20 @@ def constituents_sp500() -> list:
 
 @st.cache_data(ttl=86400)
 def constituents_nasdaq100() -> list:
+    """Nasdaq-100 constituents from Nasdaq's own list; Wikipedia as fallback."""
     try:
-        tables = _wiki_tables("https://en.wikipedia.org/wiki/Nasdaq-100")
+        r = requests.get("https://api.nasdaq.com/api/quote/list-type/nasdaq100",
+                         headers={**_WIKI_HEADERS, "Accept": "application/json"}, timeout=25)
+        rows = r.json()["data"]["data"]["rows"]
+        if len(rows) >= 95:
+            CONSTITUENT_SOURCE["Nasdaq 100"] = "Nasdaq official list"
+            return [row["symbol"].replace(".", "-") for row in rows]
+    except Exception:
+        pass
+    try:
+        # The constituents table moved off the main Nasdaq-100 article in 2026.
+        CONSTITUENT_SOURCE["Nasdaq 100"] = "Wikipedia (fallback)"
+        tables = _wiki_tables("https://en.wikipedia.org/wiki/List_of_NASDAQ-100_companies")
         for t in tables:
             for col in t.columns:
                 name = str(col).lower()
@@ -553,8 +328,29 @@ def constituents_nasdaq100() -> list:
 
 @st.cache_data(ttl=86400)
 def constituents_sox() -> list:
-    # PHLX Semiconductor Sector — top ~30 names. Update from
-    # https://www.nasdaq.com/market-activity/quotes/sox if needed.
+    """PHLX Semiconductor (SOX) constituents from Nasdaq's index weighting data
+    for the latest weekday; a static list only as fallback (it goes stale — in
+    Oct 2026 7 of its 30 names had already left the index)."""
+    for back in range(0, 8):
+        day = datetime.now() - timedelta(days=back)
+        if day.weekday() >= 5:
+            continue
+        try:
+            r = requests.post(
+                "https://indexes.nasdaqomx.com/Index/WeightingData",
+                data={"id": "SOX", "tradeDate": day.strftime("%Y-%m-%dT00:00:00.000"),
+                      "timeOfDay": "SOD"},
+                headers={**_WIKI_HEADERS, "X-Requested-With": "XMLHttpRequest",
+                         "Referer": "https://indexes.nasdaqomx.com/Index/Weighting/SOX"},
+                timeout=25)
+            rows = r.json().get("aaData") or []
+            tickers = [row["Symbol"].replace(".", "-") for row in rows if row.get("Symbol")]
+            if len(tickers) >= 25:
+                CONSTITUENT_SOURCE["SOX"] = f"Nasdaq index weighting ({day:%Y-%m-%d})"
+                return tickers
+        except Exception:
+            continue
+    CONSTITUENT_SOURCE["SOX"] = "static list (fallback)"
     return [
         "NVDA", "AVGO", "TSM", "AMD", "QCOM", "TXN", "MU", "INTC", "ADI", "KLAC",
         "LRCX", "AMAT", "MRVL", "NXPI", "MCHP", "ON", "MPWR", "SWKS", "STM",
@@ -630,25 +426,28 @@ def constituents_taiwan() -> list:
 
 @st.cache_data(ttl=86400)
 def constituents_csi300() -> list:
-    """CSI 300 constituents via akshare. Returns yfinance-formatted tickers."""
-    try:
-        import akshare as ak
-        df = ak.index_stock_cons_csindex(symbol="000300")
-        # Code column is the stock code; SH (6xxxxx) or SZ (0xxxxx / 3xxxxx)
-        codes = df["成分券代码"].astype(str).str.zfill(6) if "成分券代码" in df.columns else df.iloc[:, 0].astype(str).str.zfill(6)
-        out = []
-        for c in codes:
-            suffix = ".SS" if c.startswith("6") else ".SZ"
-            out.append(c + suffix)
-        return out
-    except Exception:
-        return []
+    """CSI 300 constituents from CSIndex (via akshare). Returns yfinance tickers."""
+    return _csindex_constituents("000300")
 
 
 @st.cache_data(ttl=86400)
 def constituents_chinext() -> list:
-    """ChiNext (创业板) top constituents via akshare."""
+    """ChiNext Index (创业板指) constituents from CNI, the index publisher;
+    Sina via akshare as fallback."""
+    for _ in range(3):  # CNI is intermittently slow (30 s+) — retry before falling back
+        try:
+            r = requests.get("https://www.cnindex.com.cn/sample-detail/detail",
+                             params={"indexcode": "399006", "dateStr": "", "pageNum": 1, "rows": 200},
+                             headers=_WIKI_HEADERS, timeout=45)
+            rows = r.json()["data"]["rows"]
+            codes = [str(x["seccode"]).zfill(6) for x in rows if x.get("seccode")]
+            if len(codes) >= 95:
+                CONSTITUENT_SOURCE["ChiNext"] = f"CNI official ({rows[0].get('dateStr')})"
+                return [c + ".SZ" for c in codes]
+        except Exception:
+            continue
     try:
+        CONSTITUENT_SOURCE["ChiNext"] = "Sina via akshare (fallback)"
         import akshare as ak
         df = ak.index_stock_cons_sina(symbol="399006")
         codes = df["code"].astype(str).str.zfill(6) if "code" in df.columns else df.iloc[:, 0].astype(str).str.zfill(6)
@@ -732,18 +531,28 @@ def constituents_russell2000() -> list:
 
 @st.cache_data(ttl=86400)
 def constituents_csi1000() -> list:
-    """CSI 1000 constituents via akshare."""
-    try:
-        import akshare as ak
-        df = ak.index_stock_cons_csindex(symbol="000852")
-        codes = df["成分券代码"].astype(str).str.zfill(6) if "成分券代码" in df.columns else df.iloc[:, 0].astype(str).str.zfill(6)
-        out = []
-        for c in codes:
-            suffix = ".SS" if c.startswith("6") else ".SZ"
-            out.append(c + suffix)
-        return out
-    except Exception:
-        return []
+    """CSI 1000 constituents from CSIndex (via akshare). Returns yfinance tickers."""
+    return _csindex_constituents("000852")
+
+
+def _csindex_constituents(code: str) -> list:
+    """CSIndex's official list for `code`. Retried: the request fails
+    intermittently (a one-off empty list blanked CSI 1000 for a whole run)."""
+    import time
+    for attempt in range(3):
+        try:
+            import akshare as ak
+            df = ak.index_stock_cons_csindex(symbol=code)
+            col = "成分券代码" if "成分券代码" in df.columns else df.columns[0]
+            codes = df[col].astype(str).str.zfill(6)
+            # SH codes start with 6; SZ with 0 / 3
+            tickers = [c + (".SS" if c.startswith("6") else ".SZ") for c in codes]
+            if tickers:
+                return tickers
+        except Exception:
+            pass
+        time.sleep(5 * (attempt + 1))
+    return []
 
 
 @st.cache_data(ttl=86400)
@@ -764,9 +573,11 @@ def constituents_nikkei225() -> list:
             df = pd.read_csv(io.StringIO(r.text))
             code_col = next((c for c in df.columns if "code" in str(c).lower()), None)
             if code_col is not None:
-                codes = df[code_col].astype(str).str.extract(r"(\d{4})")[0].dropna().unique()
+                # Codes can be alphanumeric (e.g. 285A, 543A) — \d{4} dropped them
+                codes = df[code_col].astype(str).str.extract(r"([0-9]{3}[0-9A-Z])")[0].dropna().unique()
                 tickers = [c + ".T" for c in codes]
                 if len(tickers) >= 200:
+                    CONSTITUENT_SOURCE["Nikkei 225"] = "Nikkei official weight file"
                     return tickers
     except Exception:
         pass
@@ -779,7 +590,7 @@ def constituents_nikkei225() -> list:
         )
         if r.status_code == 200:
             import re as _re
-            codes = _re.findall(r'>\s*(\d{4})\s*<', r.text)
+            codes = _re.findall(r'>\s*([0-9]{3}[0-9A-Z])\s*<', r.text)
             seen = set()
             uniq = []
             for c in codes:
@@ -787,11 +598,13 @@ def constituents_nikkei225() -> list:
                     seen.add(c)
                     uniq.append(c)
             if len(uniq) >= 200:
+                CONSTITUENT_SOURCE["Nikkei 225"] = "Nikkei component page"
                 return [c + ".T" for c in uniq]
     except Exception:
         pass
 
     # Fallback 2: hardcoded top 50 (proxy)
+    CONSTITUENT_SOURCE["Nikkei 225"] = "static top-50 list (fallback)"
     return [
         "7203.T", "6758.T", "6861.T", "9984.T", "8035.T", "9432.T",
         "8306.T", "6098.T", "9433.T", "7974.T", "8316.T", "4063.T",
@@ -814,7 +627,8 @@ def constituents_topix() -> list:
     Falls back to EWJ ETF holdings (~180 stocks), then Nikkei 225, if JPX fails.
     """
     try:
-        url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
+        # JPX switched this file from .xls to .xlsx in 2026 (the .xls URL now 404s).
+        url = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xlsx"
         r = requests.get(url, headers=_WIKI_HEADERS, timeout=30)
         if r.status_code == 200 and len(r.content) > 50000:
             df = pd.read_excel(io.BytesIO(r.content), sheet_name=0)
@@ -824,8 +638,10 @@ def constituents_topix() -> list:
             if market_col and code_col:
                 prime = df[df[market_col].astype(str).str.contains("プライム.*内国|Prime.*Domestic", regex=True, na=False)]
                 codes = prime[code_col].dropna().astype(str).str.zfill(4)
-                tickers = [c + ".T" for c in codes if c.isdigit() and len(c) == 4]
+                # Codes are 4 chars; newer listings are alphanumeric (e.g. "285A").
+                tickers = [c + ".T" for c in codes if c.isalnum() and len(c) == 4]
                 if len(tickers) >= 1000:
+                    CONSTITUENT_SOURCE["Topix"] = "JPX listed companies (Prime)"
                     return tickers
     except Exception:
         pass
@@ -834,8 +650,10 @@ def constituents_topix() -> list:
     ewj = _ishares_holdings("239665", "EWJ")
     valid = [t + ".T" for t in ewj if t.isdigit() and len(t) == 4]
     if len(valid) >= 100:
+        CONSTITUENT_SOURCE["Topix"] = "iShares EWJ holdings (fallback)"
         return valid
     # Fallback 2: Nikkei 225
+    CONSTITUENT_SOURCE["Topix"] = "Nikkei 225 list (fallback)"
     return constituents_nikkei225()
 
 
@@ -887,8 +705,18 @@ def _parse_aaii_xls(content: bytes) -> pd.DataFrame:
 AAII_LOCAL_FILE = Path(__file__).parent / "data" / "aaii_sentiment.xls"
 
 
-@st.cache_data(ttl=3600)
 def fetch_aaii_sentiment() -> pd.DataFrame:
+    """Invalidate parsed data whenever the uploaded file changes."""
+    try:
+        stat = AAII_LOCAL_FILE.stat()
+        version = (stat.st_mtime_ns, stat.st_size)
+    except FileNotFoundError:
+        version = None
+    return _fetch_aaii_sentiment_cached(version)
+
+
+@st.cache_data(ttl=3600)
+def _fetch_aaii_sentiment_cached(file_version) -> pd.DataFrame:
     """Returns DataFrame with columns Date, Bullish, Neutral, Bearish, Net.
 
     Order:
@@ -1022,114 +850,38 @@ def fetch_stockcharts_image(symbol: str, period: str) -> str:
 BARCHART_LOCAL_JSON = Path(__file__).parent / "data" / "barchart_pc.json"
 
 
-@st.cache_data(ttl=90000)  # 25 hours
 def fetch_putcall_ratio() -> dict:
-    """S&P 500 ($SPX) put/call ratio scraped directly from Barchart.
-
-    Same source the boss linked to in his email:
-        https://www.barchart.com/stocks/quotes/$SPX/put-call-ratios
-
-    Order:
-    0. Local JSON at data/barchart_pc.json (pushed by GitHub Actions) — preferred,
-       because server's datacenter IP is blocked by Cloudflare on barchart.com.
-    1. Direct curl scrape (works from residential IPs only).
-    2. SPY options chain (yfinance) as last-resort fallback — different instrument,
-       different numbers; only useful as a rough proxy.
-    """
-    # Method 0: local JSON pushed by GitHub Actions (preferred — bypasses Cloudflare)
-    if BARCHART_LOCAL_JSON.exists():
-        try:
-            import json as _json
-            import time as _time
-            age_hours = (_time.time() - BARCHART_LOCAL_JSON.stat().st_mtime) / 3600
-            if age_hours < 96:  # accept up to 96h — covers Fri→Mon weekend gap (Barchart cron is Mon-Fri) and most single-day holidays
-                cached = _json.loads(BARCHART_LOCAL_JSON.read_text())
-                if cached.get("vol_ratio") and cached.get("oi_ratio"):
-                    return cached
-        except Exception:
-            pass
-
-    # Method 1: Barchart $SPX (authoritative — same numbers the boss sees)
+    """Read the validated SPX snapshot each rerun; never substitute SPY."""
+    import json
+    import math
+    from datetime import timezone
     try:
-        ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-              "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
-              "Safari/605.1.15 Chrome/120.0")
-        result = subprocess.run(
-            ["curl", "-sL", "-A", ua,
-             "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-             "-H", "Accept-Language: en-US,en;q=0.9",
-             "https://www.barchart.com/stocks/quotes/%24SPX/put-call-ratios"],
-            capture_output=True, text=True, timeout=20
-        )
-        html = result.stdout
-        if len(html) > 50000:
-            import re
-            def grab(label_pattern):
-                m = re.search(label_pattern + r'</span></div><div[^>]*>([\d,]+(?:\.\d+)?)', html)
-                if m:
-                    return m.group(1).replace(",", "")
-                # Looser pattern
-                m = re.search(label_pattern + r'.{0,200}?>\s*([\d,]+(?:\.\d+)?)\s*<', html, re.DOTALL)
-                return m.group(1).replace(",", "") if m else None
-
-            put_vol  = grab(r'Put Volume Total')
-            call_vol = grab(r'Call Volume Total')
-            vol_pc   = grab(r'Put/Call Volume Ratio')
-            put_oi   = grab(r'Put Open Interest Total')
-            call_oi  = grab(r'Call Open Interest Total')
-            oi_pc    = grab(r'Put/Call Open Interest Ratio')
-
-            if vol_pc and oi_pc:
-                return {
-                    "source": "Barchart $SPX",
-                    "vol_ratio": float(vol_pc),
-                    "oi_ratio":  float(oi_pc),
-                    "total_call_vol": int(float(call_vol)) if call_vol else 0,
-                    "total_put_vol":  int(float(put_vol))  if put_vol  else 0,
-                    "total_call_oi":  int(float(call_oi))  if call_oi  else 0,
-                    "total_put_oi":   int(float(put_oi))   if put_oi   else 0,
-                    "by_expiry": [],  # Barchart doesn't break down by expiration on free page
-                    "asof": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                }
-    except Exception:
-        pass
-
-    # Method 2 (fallback): SPY options via yfinance
-    try:
-        tk = yf.Ticker("SPY")
-        expirations = tk.options[:4]
-        if not expirations:
+        cached = json.loads(BARCHART_LOCAL_JSON.read_text())
+        if not str(cached.get("source", "")).startswith("Barchart $SPX"):
             return {}
-        total_call_vol = total_put_vol = 0
-        total_call_oi = total_put_oi = 0
-        by_expiry = []
-        for exp in expirations:
-            try:
-                chain = tk.option_chain(exp)
-                cv = int(chain.calls["volume"].fillna(0).sum())
-                pv = int(chain.puts["volume"].fillna(0).sum())
-                co = int(chain.calls["openInterest"].fillna(0).sum())
-                po = int(chain.puts["openInterest"].fillna(0).sum())
-                total_call_vol += cv; total_put_vol += pv
-                total_call_oi  += co; total_put_oi  += po
-                by_expiry.append({
-                    "expiration": exp,
-                    "call_vol": cv, "put_vol": pv, "call_oi": co, "put_oi": po,
-                    "vol_ratio": pv / cv if cv > 0 else None,
-                    "oi_ratio":  po / co if co > 0 else None,
-                })
-            except Exception:
-                continue
-        if not by_expiry:
+        for key in ("vol_ratio", "oi_ratio", "total_put_vol", "total_call_vol",
+                    "total_put_oi", "total_call_oi"):
+            value = cached[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return {}
+            if not math.isfinite(value) or value < 0:
+                return {}
+        for numerator, denominator, ratio in (
+            ("total_put_vol", "total_call_vol", "vol_ratio"),
+            ("total_put_oi", "total_call_oi", "oi_ratio"),
+        ):
+            if cached[denominator] <= 0:
+                return {}
+            if abs(cached[numerator] / cached[denominator] - cached[ratio]) > 0.011:
+                return {}
+        fetched = datetime.fromisoformat(cached["asof"].replace("Z", "+00:00"))
+        if fetched.tzinfo is None:
             return {}
-        return {
-            "source": "SPY options (fallback)",
-            "vol_ratio": total_put_vol / total_call_vol if total_call_vol > 0 else None,
-            "oi_ratio":  total_put_oi  / total_call_oi  if total_call_oi  > 0 else None,
-            "total_call_vol": total_call_vol, "total_put_vol": total_put_vol,
-            "total_call_oi":  total_call_oi,  "total_put_oi":  total_put_oi,
-            "by_expiry": by_expiry,
-            "asof": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        }
-    except Exception:
+        age = (datetime.now(timezone.utc) - fetched).total_seconds() / 3600
+        if age < -0.1:
+            return {}
+        cached["stale"] = age > 96
+        cached["age_hours"] = age
+        return cached
+    except (OSError, ValueError, KeyError, TypeError):
         return {}

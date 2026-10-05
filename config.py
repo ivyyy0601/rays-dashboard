@@ -12,9 +12,9 @@ INDICES = {
     "CSI 1000":    {"index": "000852.SS", "etf": "560010.SS"},
     "ChiNext":     {"index": "399006.SZ", "etf": "159915.SZ"},
     "Nikkei 225":  {"index": "^N225",     "etf": "1321.T"},
-    "Topix":       {"index": "1308.T",    "etf": "1308.T"},      # iShares Topix ETF (corr 0.93 with N225)
+    "Topix":       {"index": "TSE:TOPIX", "etf": "1308.T"},      # True index; ETF only for explicitly ETF-based features
     "Taiwan":      {"index": "^TWII",     "etf": "0050.TW"},
-    "KOSPI 200":   {"index": "^KS200",    "etf": "069500.KS"},
+    "KOSPI 200":   {"index": "KRX:KOSPI200", "etf": "069500.KS"},
 }
 
 # TradingView symbols for RSI — table RSI(14) is pulled DIRECTLY from TradingView's
@@ -76,4 +76,55 @@ INDEX_THEORETICAL_SIZE = {
     "Topix":       1574,    # TSE Prime market = Topix (post-2022 reorganization)
     "Taiwan":      1100,    # TWSE listed stocks ~1,100 (full list via TWSE openapi)
     "KOSPI 200":   200,
+}
+
+# ---------- Tab 2 snapshot (index_snapshot.py) ----------
+
+# Close + RSI come from TradingView's dated daily index snapshot for these
+# (Yahoo has no usable series for the real index; no ETF proxy, no history).
+TV_SNAPSHOT_INDICES = {"Topix", "KOSPI 200"}
+
+# Index volume & turnover = Σ of every constituent's daily volume / close × volume.
+# Provider "index volume" fields were checked against official figures and are
+# not the index's own volume (^NDX/^GSPC/Sina ChiNext report a wider market,
+# ^N225 an unknown unit, RTY=F futures contracts). Value = minimum list size
+# expected — a shorter list means a fallback/broken source and is flagged.
+CONSTITUENT_MIN = {
+    "S&P 500": 495, "Nasdaq 100": 98, "SOX": 28, "Russell 2000": 1800,
+    "Hang Seng": 80, "CSI 300": 290, "CSI 1000": 950, "ChiNext": 95,
+    "Nikkei 225": 220, "Topix": 1400, "Taiwan": 1000, "KOSPI 200": 190,
+}
+# A session counts (latest day and every day in the 20-day window) only if at
+# least this share of the listed constituents reported volume that day.
+CONSTITUENT_COVERAGE_MIN = 0.9
+
+# Trading currency of each index's constituents, and its Yahoo FX ticker
+# (quoted as units of currency per 1 USD) for the USD turnover column.
+INDEX_CURRENCY = {
+    "S&P 500": "USD", "Nasdaq 100": "USD", "SOX": "USD", "Russell 2000": "USD",
+    "Hang Seng": "HKD", "CSI 300": "CNY", "CSI 1000": "CNY", "ChiNext": "CNY",
+    "Nikkei 225": "JPY", "Topix": "JPY", "Taiwan": "TWD", "KOSPI 200": "KRW",
+}
+FX_TICKERS = {"HKD": "HKD=X", "CNY": "CNY=X", "JPY": "JPY=X", "TWD": "TWD=X", "KRW": "KRW=X"}
+
+# Constituent-list monitoring: every run diffs today's list with the last saved
+# one (data/constituents/), logs changes to data/constituent_changes.csv, and
+# warns if a list hasn't changed for longer than its index normally goes
+# between reviews — a sign the source stopped updating.
+MAX_DAYS_LIST_UNCHANGED = {
+    "S&P 500": 120, "Nasdaq 100": 400, "SOX": 400, "Russell 2000": 400,
+    "Hang Seng": 120, "CSI 300": 200, "CSI 1000": 200, "ChiNext": 200,
+    "Nikkei 225": 200, "Topix": 60, "Taiwan": 60, "KOSPI 200": 200,
+}
+
+# Cross-check for constituent lists that come from Wikipedia (no official
+# source): every run compares Yahoo's index-level volume with our Σ
+# constituents on the same day. A ratio outside the normal band means the list
+# is probably out of date (a missing or extra heavyweight) → row flagged, no
+# alert. Bands from 20 sessions of observations (Oct 2026): ^HSI ran 1.05–1.11;
+# ^KS200 (reported in thousands of shares) 1.01.
+# index: (Yahoo ticker, unit multiplier, (low, high))
+VOLUME_CROSSCHECK = {
+    "Hang Seng": ("^HSI", 1, (1.02, 1.15)),
+    "KOSPI 200": ("^KS200", 1000, (0.95, 1.07)),
 }

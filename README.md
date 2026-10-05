@@ -4,6 +4,8 @@ A full-stack market-sentiment analytics platform that tracks **12 global equity 
 
 Built with Python + Streamlit, deployed 24/7 on a Linux VPS behind nginx, with a cron-driven daily data pipeline and a daily AI market brief delivered by email.
 
+**Live:** http://91.98.37.33/sentiment/
+
 ---
 
 ## Features
@@ -16,22 +18,29 @@ The dashboard is organized into four tabs plus an always-on AI sidebar.
 - **AAII Investor Sentiment** (Bullish / Neutral / Bearish, weekly)
 - **S&P 500 Put/Call ratio** (volume & open-interest, from Barchart's $SPX)
 
-### 2. Indices — RSI & Volume
-- **RSI(14)** pulled directly from TradingView so values match what you see on tradingview.com
-- **Real daily trading volume** with **no ETF proxies**:
-  - most indices use their own aggregate volume
-  - **SOX / Topix** sum their constituents (their own tickers report no usable volume)
-  - **Russell 2000** uses front-month futures volume (the index ticker's volume is a data-feed bug)
-- Per-index **Δ vs 20-day average** with HIGH/LOW activity alerts
-- 3-month RSI history chart (computed on the full series, displayed for the recent window)
+### 2. Indices — RSI & Turnover
+- **Close & RSI(14)**: Yahoo daily close (A-shares: Sina via AkShare) with RSI computed locally on the
+  same closes; **Topix / KOSPI 200** use TradingView's dated daily index snapshot
+- **Index volume and turnover = Σ of all constituents** (volume, and close × volume). Provider
+  "index volume" fields were checked against official figures (Nasdaq, CNI, CSIndex) and don't
+  measure the index itself; constituent sums matched every official figure available
+- **Turnover** is shown in USD (comparable across markets); its **Δ vs the prior 20-session average**
+  (local currency) drives the HIGH/LOW alerts at ±10%
+- Built from **one daily snapshot** (`index_snapshot.py`) so close and volume/turnover dates are explicit per row
+- **Data checks**: only completed sessions; a session counts only if ≥ 90% of constituents traded;
+  short constituent lists, duplicate or incomplete days flagged ⚠️ (flagged rows never alert)
+- 3-month RSI history chart
 
 ### 3. Breadth & Advance/Decline
 - **% of constituents above the 50-day and 200-day moving averages** (single-MA and "above both")
 - **Daily advancers vs decliners** and a 30-day net breadth trend
-- Per-index coverage indicator (constituents fetched ÷ index size)
+- Computed in the same daily snapshot as Tab 2 — same constituent lists, same download, same latest session
+- Per-index coverage (names with a 200-day MA ÷ current constituent list)
 
 ### 4. Options
-- Barchart **$SPX Put/Call ratio** chart (price + volume ratio + open-interest ratio)
+- Barchart **$SPX Put/Call ratio** — volume and open-interest ratios plus reported totals
+- Snapshot is validated on read (ratios must match the totals); shows fetch time and warns when older than 96 h
+- No SPY substitution — if validated $SPX data is missing, the panel says so and links to Barchart
 
 ### AI Market Analyst (sidebar + email)
 - **Streaming chat** powered by the **Anthropic Claude API** — answers questions against the *current* dashboard data
@@ -50,18 +59,18 @@ The dashboard is organized into four tabs plus an always-on AI sidebar.
                          │  breadth_cache.json (cache)   │
                          └───────────────▲──────────────┘
                                          │ writes (daily)
-   cron 19:40 ET ──► run_daily.py ──► update_cache.py ──► check_alerts.py ──► email
+   08:00 HKT timer ─► run_daily.py ──► update_cache.py ──► check_alerts.py ──► email
                                          │                      │
                   ┌──────────────────────┴───────┐        ai_analysis.py
                   │  data.py — unified data layer │        (Claude API)
                   └──────────────────────────────┘
                      │  multi-source + fallback
-        yfinance · akshare · Baostock · TradingView · Vanguard/iShares · Barchart · AAII
+        yfinance · akshare · TradingView · index publishers / ETF holdings · Barchart · AAII
 ```
 
 **Layers**
 
-- **Data layer (`data.py`)** — a unified access layer over 6+ heterogeneous sources with priority-based **automatic fallback** (e.g. A-shares: akshare → Baostock → yfinance), constituent-list fetching, and caching. Designed around real-world constraints: some sources block datacenter IPs, some return bad/missing fields, and volume units differ across markets.
+- **Data layer (`data.py`)** — a unified access layer over 6+ heterogeneous sources with priority-based **automatic fallback**, constituent lists from index publishers / exchanges / tracking-ETF holdings, and caching. Designed around real-world constraints: some sources block datacenter IPs, some return bad/missing fields, and volume units differ across markets.
 - **Indicators (`indicators.py`)** — RSI (Wilder), breadth, advance/decline, and volume/turnover summaries (incomplete-bar-safe, baseline excludes the current day).
 - **Daily pipeline (`update_cache.py` → `check_alerts.py`)** — fetches all constituents, computes breadth + volume for 12 indices, writes a cache file, evaluates alerts, generates the AI brief, and emails a daily summary.
 - **Frontend (`dashboard.py`)** — multi-tab Streamlit UI with cache-first / live-fallback rendering, tiered alerts, and data-freshness labels.
@@ -75,19 +84,18 @@ The dashboard is organized into four tabs plus an always-on AI sidebar.
 | Data | Primary | Fallback |
 |---|---|---|
 | Index OHLCV / RSI inputs | yfinance | akshare (CN indices) |
-| RSI(14) | TradingView | locally computed (Wilder) |
-| A-share constituents' prices | akshare | Baostock → yfinance |
+| RSI(14) | locally computed (Wilder); TradingView for Topix / KOSPI 200 | — |
+| Constituents' daily prices & volume (all markets) | yfinance (one shared download per day) | — |
 | Constituent lists | Wikipedia / exchange APIs | Vanguard (Russell), Nikkei official CSV |
-| Volume (SOX/Topix) | constituent aggregation | — |
-| Volume (Russell 2000) | futures (`RTY=F`) | — |
+| Index volume & turnover | Σ constituents (Yahoo per-stock data) | — |
 | AAII sentiment | aaii.com `.xls` (via GitHub Action) | local cached file |
-| $SPX Put/Call | Barchart (via GitHub Action) | SPY options proxy (yfinance) |
+| $SPX Put/Call | Barchart (via GitHub Action) | none — shows a warning instead of a proxy |
 
 ---
 
 ## Tech Stack
 
-`Python` · `Streamlit` · `pandas` / `numpy` · `yfinance` · `akshare` / `Baostock` · `tradingview-ta` · `Anthropic Claude API` · `Playwright` · `nginx` · `systemd` · `cron` · `GitHub Actions` · `Hetzner Cloud (Ubuntu)`
+`Python` · `Streamlit` · `pandas` / `numpy` · `yfinance` · `akshare` · `tradingview-ta` · `Anthropic Claude API` · `Playwright` · `nginx` · `systemd` · `cron` · `GitHub Actions` · `Hetzner Cloud (Ubuntu)`
 
 ---
 
@@ -98,14 +106,15 @@ The dashboard is organized into four tabs plus an always-on AI sidebar.
 ├── dashboard.py          # Streamlit app (4 tabs + AI sidebar)
 ├── data.py               # unified multi-source data layer (fetch + fallback + cache)
 ├── indicators.py         # RSI, breadth, advance/decline, volume summaries
+├── index_snapshot.py     # daily Tab 2 snapshot: close / RSI / volume / turnover + data checks
 ├── config.py             # indices, tickers, thresholds, windows
-├── update_cache.py       # daily: fetch constituents → compute → write cache
+├── update_cache.py       # daily: index snapshot, then breadth → write caches
 ├── check_alerts.py       # daily: evaluate alerts + AI brief → email
 ├── alerts.py             # alert rules
 ├── ai_analysis.py        # Claude API: streaming chat + daily summary
 ├── run_daily.py          # cron entrypoint (update_cache then check_alerts)
 ├── requirements.txt
-├── deploy/               # nginx, systemd, cron, server setup scripts
+├── deploy/               # systemd units (dashboard + daily timer), setup scripts, DEPLOY.md
 └── .github/workflows/    # AAII + Barchart sync to server
 ```
 
@@ -118,7 +127,6 @@ The dashboard is organized into four tabs plus an always-on AI sidebar.
 ```bash
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-playwright install chromium          # for the Barchart chart
 
 streamlit run dashboard.py
 ```
@@ -129,6 +137,7 @@ streamlit run dashboard.py
 |---|---|---|
 | `anthropic_key.json` | Claude API key for the AI features | optional (AI degrades gracefully without it) |
 | `email_config.json` | SMTP credentials for the daily alert email | optional |
+| `tushare_token.json` | Tushare API token (A-share data) | optional |
 
 Copy the examples and fill in your values:
 
@@ -143,22 +152,20 @@ The AI key can also be supplied via the `ANTHROPIC_API_KEY` environment variable
 
 ## Deployment (Linux VPS)
 
-```bash
-# 1. upload code
-bash deploy/upload_to_server.sh root@YOUR_SERVER_IP
-# 2. install deps, systemd service, nginx, and the daily cron
-ssh root@YOUR_SERVER_IP 'bash /opt/rays/deploy/finalize.sh'
-# 3. build the first cache
-ssh root@YOUR_SERVER_IP 'sudo -u rays /opt/rays/venv/bin/python /opt/rays/update_cache.py'
-```
+Runs on a Hetzner VPS at `/opt/rays` as the systemd service `streamlit`
+(`127.0.0.1:8501`, `--server.baseUrlPath sentiment`), behind an nginx that also
+serves a second dashboard under `/etf/`.
 
-The dashboard is then served on port 80 via nginx → Streamlit (systemd service `streamlit`).
+Full deployment and operations guide (Chinese): **[deploy/DEPLOY.md](deploy/DEPLOY.md)**.
 
 ### Daily automation
 
-A cron job runs `run_daily.py` every day at **19:40 ET** (after the US close):
+A systemd timer (`rays-daily.timer`) runs `run_daily.py` every day at **08:00 Hong Kong time**
+(after the US close; fixed in HKT, so US daylight saving doesn't move it). Every index uses its
+**latest completed session** — a market already trading at 08:00 HKT (Tokyo, Seoul) contributes
+its previous session.
 
-1. `update_cache.py` — rebuilds breadth + volume for all 12 indices into `data/breadth_cache.json`
+1. `update_cache.py` — builds the index snapshot: Tab 2 close / RSI / volume / turnover (`data/index_snapshot.json`) and Tab 3 breadth (`data/breadth_cache.json`) from one download
 2. `check_alerts.py` — evaluates alerts, generates the AI brief, and emails the daily summary
 
 The web app always reads the cache, so page loads stay fast regardless of pipeline runtime.

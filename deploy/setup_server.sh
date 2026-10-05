@@ -27,7 +27,7 @@ apt-get install -y -qq \
     libgbm1 libpango-1.0-0 libpangocairo-1.0-0 libgtk-3-0 \
     fonts-liberation fonts-noto-cjk
 
-# 3. Set timezone to NY (so cron 19:40 = 8 PM ET)
+# 3. Set timezone to NY (Streamlit / logs in ET; the daily timer is pinned to HKT itself)
 echo "==> Setting timezone to America/New_York..."
 timedatectl set-timezone America/New_York
 echo "Current time: $(date)"
@@ -64,7 +64,7 @@ echo "========================================"
 echo "✓ Server base setup complete!"
 echo ""
 echo "Next steps (from your Mac):"
-echo "1. Upload code:    bash deploy/upload_to_server.sh root@YOUR_IP"
+echo "1. Upload code:    bash server/deploy.sh sentiment   (from the final/ folder)"
 echo "2. SSH in:         ssh root@YOUR_IP"
 echo "3. Finish setup:   bash /opt/rays/deploy/finalize.sh"
 echo "========================================"

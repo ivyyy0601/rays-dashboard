@@ -18,25 +18,22 @@ systemctl daemon-reload
 systemctl enable streamlit
 systemctl start streamlit
 
-echo "==> Installing nginx config..."
-cp /opt/rays/deploy/nginx.conf /etc/nginx/sites-available/rays
-ln -sf /etc/nginx/sites-available/rays /etc/nginx/sites-enabled/rays
-rm -f /etc/nginx/sites-enabled/default
-nginx -t && systemctl reload nginx
+# nginx is shared with etf-tracker and lives outside this repo
+# (final/server/nginx.conf → /etc/nginx/sites-enabled/rays). Install it separately.
 
-echo "==> Installing daily cron job (19:40 NY time)..."
-sudo -u rays bash <<'EOSU'
-(crontab -l 2>/dev/null | grep -v "rays/run_daily.py"; echo "40 19 * * * /opt/rays/venv/bin/python /opt/rays/run_daily.py >> /opt/rays/data/cron.log 2>&1") | crontab -
-crontab -l
-EOSU
+echo "==> Installing daily refresh timer (08:00 Hong Kong time)..."
+cp /opt/rays/deploy/rays-daily.service /opt/rays/deploy/rays-daily.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now rays-daily.timer
+systemctl list-timers rays-daily.timer --no-pager
 
 echo ""
 echo "========================================"
 echo "✓ Deployment complete!"
 echo ""
-echo "Streamlit running at:  http://$(curl -s ifconfig.me)/"
+echo "Streamlit running at:  http://$(curl -s ifconfig.me)/sentiment/  (once nginx is configured)"
 echo "Service status:        systemctl status streamlit"
-echo "Cron jobs:             sudo -u rays crontab -l"
+echo "Daily timer:           systemctl list-timers rays-daily.timer"
 echo "Daily logs:            tail -f /opt/rays/data/cron.log"
 echo ""
 echo "Test alert email NOW:  sudo -u rays /opt/rays/venv/bin/python /opt/rays/check_alerts.py"

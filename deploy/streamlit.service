@@ -1,3 +1,10 @@
+# Market Sentiment Dashboard — always-on Streamlit web service.
+# Live at http://91.98.37.33/sentiment/ (nginx /sentiment/ → 127.0.0.1:8501).
+#
+# Server path: /etc/systemd/system/streamlit.service
+#   sudo systemctl daemon-reload && sudo systemctl restart streamlit
+# Logs: tail -f /opt/rays/data/streamlit.log
+
 [Unit]
 Description=Rays Market Sentiment Dashboard (Streamlit)
 After=network.target
@@ -9,7 +16,7 @@ Group=rays
 WorkingDirectory=/opt/rays
 Environment="PATH=/opt/rays/venv/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="TZ=America/New_York"
-ExecStart=/opt/rays/venv/bin/streamlit run dashboard.py --server.port 8501 --server.address 127.0.0.1 --server.headless true --browser.gatherUsageStats false
+ExecStart=/opt/rays/venv/bin/streamlit run dashboard.py --server.port 8501 --server.baseUrlPath sentiment --server.address 127.0.0.1 --server.headless true --browser.gatherUsageStats false
 Restart=always
 RestartSec=10
 StandardOutput=append:/opt/rays/data/streamlit.log

@@ -14,15 +14,43 @@ import streamlit as st
 import config
 import data
 import indicators
+import index_snapshot
 import ai_analysis
 
 ET = ZoneInfo("America/New_York")
 CACHE_FILE = Path(__file__).parent / "data" / "breadth_cache.json"
 
-# No auto-refresh — user wants daily updates, not intraday. Manual "Refresh now"
-# button still works. Cron job at 5:30 AM ET handles daily breadth + alert email.
+# No live fetching: every tab reads files written by the daily run (08:00 HKT,
+# systemd rays-daily.timer) or pushed by GitHub Actions (AAII, Barchart).
 
 st.set_page_config(page_title="Market Sentiment Dashboard", layout="wide")
+
+
+# ---- Top navigation shared by the three dashboards on this server ----
+_SITES = [("Stock Sentiment", "/dashboard/"), ("Market Sentiment", "/sentiment/"),
+          ("ETF Tracker", "/etf/")]
+
+
+def _site_nav(current: str):
+    """A row of links to the three dashboards; `current` is highlighted."""
+    links = "".join(
+        f'<a href="{url}" target="_self" class="site-nav-btn{" current" if url == current else ""}">{label}</a>'
+        for label, url in _SITES
+    )
+    st.markdown(
+        "<style>"
+        ".site-nav{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 12px}"
+        ".site-nav-btn{padding:6px 14px;border:1px solid #d0d4dc;border-radius:8px;"
+        "text-decoration:none!important;color:#31333f!important;font-size:0.9rem}"
+        ".site-nav-btn:hover{border-color:#ff4b4b;color:#ff4b4b!important}"
+        ".site-nav-btn.current{background:#31333f;border-color:#31333f;color:#fff!important}"
+        "</style>"
+        f'<div class="site-nav">{links}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+_site_nav("/sentiment/")
 st.title("Market Sentiment Dashboard")
 
 now_et = datetime.now(ET)
@@ -37,17 +65,12 @@ if cache_file_path.exists():
 else:
     last_update_str = "(no data yet — first cron pending)"
 
-header_c1, header_c2 = st.columns([4, 1])
-with header_c1:
-    st.caption(
-        f"🕐 **Page opened: {now_str} ET**  ·  "
-        f"📦 **Data last updated by cron: {last_update_str}** (daily at 19:40 ET). "
-        f"Click 🔄 to force fresh fetch (lightweight data only)."
-    )
-with header_c2:
-    if st.button("🔄 Refresh now", help="Force re-download lightweight data (VIX, RSI, etc.)"):
-        st.cache_data.clear()
-        st.rerun()
+st.caption(
+    f"🕐 **Page opened: {now_str} ET**  ·  "
+    f"📦 **Data last updated: {last_update_str}** — refreshed once a day at 08:00 Hong Kong "
+    f"time. Every figure uses each market's latest **completed** trading day; nothing on this "
+    f"page is fetched live."
+)
 
 st.info(
     "📌 All times shown are **New York time (ET)**. "
@@ -55,15 +78,39 @@ st.info(
 )
 
 tab1, tab2, tab3, tab4 = st.tabs(
-    ["Volatility & Sentiment", "Indices (RSI / Volume)", "Breadth & A/D", "Options"]
+    ["Volatility & Sentiment", "Indices (RSI / Turnover)", "Breadth & A/D", "Options"]
 )
+
+def _fit_width(values, px_per_char=7, padding=24, min_px=60, max_px=1400):
+    """Column width in pixels that fits the longest text in `values`."""
+    longest = max((len(str(v)) for v in values), default=0)
+    return int(min(max(longest * px_per_char + padding, min_px), max_px))
+
+
+def _text_columns(df, names):
+    """column_config sizing each named text column to its content."""
+    return {n: st.column_config.TextColumn(width=_fit_width(df[n])) for n in names if n in df}
+
+
+def _data_check(r, notes_key="notes"):
+    """Short data-quality verdict for an index-snapshot row; full notes are in
+    Tab 2's expander. Tab 3 passes "data_notes" — only the constituent-list /
+    volume checks, since breadth doesn't use the index close."""
+    notes = r.get(notes_key, r.get("notes")) or []
+    if notes:
+        return "⚠️ " + notes[0]
+    if r.get("list_change"):
+        return "✓ · constituents changed " + r["list_change"]
+    return "✓"
+
 
 # ============ TAB 1 ============
 with tab1:
     # ---- VIX ----
     st.subheader("VIX")
-    st.caption("📅 Updates daily after US market close (~16:15 ET)")
-    vix = data.fetch_yf_history(config.VIX_TICKER, days=config.HISTORY_DAYS)
+    st.caption("📅 From the daily 08:00 HKT run — latest completed US session")
+    vix = data.load_market_series(config.VIX_TICKER)
+    vix = vix[vix.index >= vix.index.max() - pd.Timedelta(days=config.HISTORY_DAYS)] if not vix.empty else vix
     if not vix.empty:
         latest = float(vix["Close"].iloc[-1])
         latest_date_dt = vix.index[-1]
@@ -92,16 +139,16 @@ with tab1:
     # ---- GLD/VIX 10-week momentum (Zac Markovich's contrarian bottom signal) ----
     st.subheader("GLD / VIX — Weekly 10-Period Momentum")
     st.caption(
-        "📅 Updates daily after US close ~16:15 ET (uses weekly bars per Zac Markovich's "
-        "note, but the current week's bar updates with every new US daily close)"
+        "📅 From the daily 08:00 HKT run (weekly bars per Zac Markovich's note; the current "
+        "week's bar updates with each new completed US session)"
     )
     st.caption(
         "Logic: weekly GLD/VIX ratio minus its value 10 weeks ago. "
         "Drops below **-7** historically marked SPY bottoms (2008, 2020, 2022). "
         "Negative momentum = VIX spiking faster than gold can keep up = extreme panic."
     )
-    gld_long = data.fetch_yf_history(config.GLD_TICKER, days=5500)
-    vix_long = data.fetch_yf_history(config.VIX_TICKER, days=5500)
+    gld_long = data.load_market_series(config.GLD_TICKER)
+    vix_long = data.load_market_series(config.VIX_TICKER)
 
     if not gld_long.empty and not vix_long.empty:
         gld_w = gld_long["Close"].resample("W-FRI").last()
@@ -209,158 +256,136 @@ with tab1:
 
 # ============ TAB 2 ============
 with tab2:
-    st.subheader("RSI & Volume by Index")
-    st.caption(
-        "📅 Each market's data becomes available at (all times in ET):  \n"
-        "US ~16:15 (after 4pm close + 15 min feed delay)  ·  HK ~04:00  ·  "
-        "A-share ~03:00  ·  Taiwan ~01:30  ·  Korea ~02:30"
-    )
-    st.caption(
-        "**Volume = real daily trading volume** (no ETF). Each index uses its own "
-        "aggregate volume; SOX sums its 30 constituents (^SOX has none) and Russell 2000 "
-        "uses RTY=F futures (^RUT volume is a yfinance bug). Units differ (shares / "
-        "contracts), so compare only the per-row **Δ vs 20d**, not absolute values."
-    )
-    def _fmt_vol(v):
-        """Humanize share volume: 9.27B, 187.70M, 325,945."""
-        if not pd.notna(v):
-            return "—"
-        if v >= 1e9:
-            return f"{v/1e9:,.2f}B"
-        if v >= 1e6:
-            return f"{v/1e6:,.2f}M"
-        return f"{v:,.0f}"
+    st.subheader("RSI & Turnover by Index")
+    snap = index_snapshot.load()
+    snap_rows = snap.get("rows", [])
+    if not snap_rows:
+        st.warning("The daily index snapshot hasn't been built yet. "
+                   "Run `python index_snapshot.py` (the daily 08:00 HKT job does this automatically).")
+    else:
+        built = pd.to_datetime(snap["built_at_et"]).strftime("%Y-%m-%d %H:%M ET")
+        st.caption(
+            f"📸 Daily snapshot built **{built}** — every number below comes from that one run "
+            "(nothing is fetched live). **Volume** and **Turnover** are the sums over all of the "
+            "index's constituents; turnover = Σ close × volume, shown in USD. "
+            "**Δ vs 20d** and **Alert** use turnover: the latest session vs the average of the "
+            "20 sessions before it (local currency)."
+        )
 
-    def _fmt_amt(v):
-        """Humanize a turnover amount (native currency): 19.70B, 444.0M, 8.4M."""
-        if not pd.notna(v):
+    def _fmt_num(v, prefix=""):
+        """Humanize: 9.27B, 187.70M, 325,945."""
+        if v is None or not pd.notna(v):
             return "—"
+        if v >= 1e12:
+            return f"{prefix}{v/1e12:,.2f}T"
         if v >= 1e9:
-            return f"{v/1e9:,.2f}B"
+            return f"{prefix}{v/1e9:,.2f}B"
         if v >= 1e6:
-            return f"{v/1e6:,.1f}M"
-        return f"{v:,.0f}"
-
-    # Volume from the daily cache (heavy constituent sums like Topix run in cron).
-    # Indices missing here (e.g. Russell) are computed live below.
-    _vol_cache = {}
-    if CACHE_FILE.exists():
-        try:
-            _c = json.loads(CACHE_FILE.read_text())
-            for r in _c.get("rows", []):
-                if r.get("volume_dev") is not None:
-                    _vol_cache[r["Index"]] = r
-        except Exception:
-            _vol_cache = {}
+            return f"{prefix}{v/1e6:,.2f}M"
+        return f"{prefix}{v:,.0f}"
 
     rows = []
-    rsi_history = {}
-    for name, conf in config.INDICES.items():
-        df_idx = data.fetch_yf_history(conf["index"], days=config.HISTORY_DAYS)
-        if df_idx.empty:
-            rows.append({"Index": name, "As of": "—", "Close": "—", "RSI(14)": "—",
-                         "RSI Alert": "—", "Volume Source": "—", "Volume": "—",
-                         "20d Avg": "—", "Δ vs 20d": "—", "Vol Alert": "no data"})
-            continue
-        close = df_idx["Close"]
-        # History chart: RSI computed locally (TradingView gives no historical series).
-        rsi_series = indicators.compute_rsi(close, config.RSI_WINDOW)
-        rsi_history[name] = rsi_series
-        # Table RSI(14): pulled directly from TradingView (matches tradingview.com).
-        # Falls back to the locally-computed value only if TradingView is unavailable.
-        rsi_latest = data.fetch_tv_rsi(name)
-        if rsi_latest is None:
-            rsi_latest = float(rsi_series.iloc[-1]) if not rsi_series.empty else float("nan")
-
-        # Trading VOLUME (real, no ETF). Prefer the daily cache (so heavy sums like
-        # Topix don't run on page load); compute live for anything not cached
-        # (e.g. Russell 2000 → RTY=F futures, fast). Source per index:
-        #   Russell 2000 → RTY=F futures (^RUT volume is a yfinance bug)
-        #   SOX / Topix  → Σ constituents (their own tickers have no usable volume)
-        #   all others   → the index ticker's own aggregate volume
-        vc = _vol_cache.get(name)
-        if vc:
-            vsum = {"latest": vc.get("volume_latest"), "avg20": vc.get("volume_avg20"),
-                    "deviation_pct": vc.get("volume_dev"),
-                    "source": vc.get("volume_source") or "?", "unit": vc.get("volume_unit") or ""}
-        else:
-            vsum = data.fetch_index_volume_summary(name, config.TURNOVER_AVG_WINDOW)
-        vdev = vsum.get("deviation_pct") if vsum else None
-        vol_source = vsum.get("source", "❌ N/A") if vsum else "❌ N/A"
-        vol_unit = vsum.get("unit", "") if vsum else ""
-
-        if pd.notna(rsi_latest) and rsi_latest > config.RSI_UPPER:
-            rsi_alert = f"OVERBOUGHT ({rsi_latest:.1f})"
-        elif pd.notna(rsi_latest) and rsi_latest < config.RSI_LOWER:
-            rsi_alert = f"OVERSOLD ({rsi_latest:.1f})"
-        else:
-            rsi_alert = "—"
-
-        if vdev is not None and vdev == vdev:
-            if vdev > config.TURNOVER_DEVIATION_PCT:
-                vol_alert = f"HIGH (+{vdev:.1f}%)"
-            elif vdev < -config.TURNOVER_DEVIATION_PCT:
-                vol_alert = f"LOW ({vdev:.1f}%)"
-            else:
-                vol_alert = "—"
-        else:
-            vol_alert = "—"
-
+    for r in snap_rows:
+        dev = r.get("turnover_dev")
+        ok = r.get("data_ok")
         rows.append({
-            "Index": name,
-            "As of": close.index[-1].strftime("%Y-%m-%d"),
-            "Close": f"{float(close.iloc[-1]):,.2f}",
-            "RSI(14)": f"{rsi_latest:.1f}" if pd.notna(rsi_latest) else "—",
-            "RSI Alert": rsi_alert,
-            "Volume Source": f"{vol_source} ({vol_unit})" if vsum else "❌ N/A",
-            "Volume": _fmt_vol(vsum.get("latest")) if vsum else "—",
-            "20d Avg": _fmt_vol(vsum.get("avg20")) if vsum else "—",
-            "Δ vs 20d": f"{vdev:+.1f}%" if (vdev is not None and vdev == vdev) else "—",
-            "Vol Alert": vol_alert,
+            "Index": r["Index"],
+            "Close date": r.get("price_date") or "—",
+            "Close": f"{r['close']:,.2f}" if r.get("close") is not None else "—",
+            "RSI(14)": f"{r['rsi']:.1f}" if r.get("rsi") is not None else "—",
+            "RSI Alert": r.get("rsi_alert", "—"),
+            "Data date": r.get("activity_date") or "—",
+            "Coverage": (f"{r['constituents_traded']}/{r['constituents']}"
+                         if r.get("constituents_traded") is not None else "—"),
+            "Volume": _fmt_num(r.get("volume")),
+            "Turnover (USD)": _fmt_num(r.get("turnover_usd"), "$"),
+            "20d Avg (USD)": _fmt_num(r.get("turnover_avg20_usd"), "$"),
+            # A row that failed its checks shows no Δ, so a bad number can't read as a signal
+            "Δ vs 20d": f"{dev:+.1f}%" if (dev is not None and ok) else "—",
+            "Alert": r.get("turnover_alert", "—"),
+            "Data check": _data_check(r),
+            "Coverage note": r.get("turnover_note") or "—",
         })
 
-    # Stash for the AI sidebar chat (RSI + volume Δ per index)
+    # Stash for the AI sidebar chat (RSI + turnover Δ per index)
     st.session_state["ai_tab2_rows"] = rows
 
-    # Height fits 12 indices + header without scroll
-    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, height=38 + 12 * 35)
+    if rows:
+        df_rows = pd.DataFrame(rows)
+        st.dataframe(df_rows, width="stretch", hide_index=True, height=38 + len(rows) * 35,
+                     column_config=_text_columns(df_rows, ["Data check", "Coverage note"]))
+        st.caption(
+            "**Coverage** = constituents that traded on the data date ÷ the current constituent "
+            "list (the volume / turnover sum covers these). It differs from Tab 3's coverage: a "
+            "new listing trades (counted here) but has no 200-day MA yet (not counted there); a "
+            "suspended stock has no volume (not counted here) but keeps its price history (counted "
+            "there). **Coverage note** names every stock left out and why, from each run's data."
+        )
 
-    with st.expander("📖 How Volume is calculated"):
+        with st.expander("🔎 Sources, 20-day window & notes per index"):
+            st.dataframe(pd.DataFrame([{
+                "Index": r["Index"],
+                "Close / RSI source": f"{r.get('close_source', '—')} · {r.get('rsi_source', '—')}",
+                "Constituents (traded / listed)":
+                    f"{r.get('constituents_traded', '—')} / {r.get('constituents', '—')}",
+                "List source": r.get("list_source") or "—",
+                "List last changed": r.get("list_last_changed") or "—",
+                "Turnover (local)": f"{_fmt_num(r.get('turnover_local'))} {r.get('currency', '')}",
+                "20d Avg (local)": f"{_fmt_num(r.get('turnover_avg20_local'))} {r.get('currency', '')}",
+                "20-day window": f"{r.get('window_start', '—')} → {r.get('window_end', '—')}",
+                "Volume cross-check": (
+                    f"{r['crosscheck']['ref']} ÷ Σ = {r['crosscheck']['ratio']:.3f} "
+                    f"(normal {r['crosscheck']['band'][0]:.2f}–{r['crosscheck']['band'][1]:.2f})"
+                    if r.get("crosscheck", {}).get("ratio") else "—"),
+                "Notes": "; ".join(r.get("notes", [])) or "—",
+            } for r in snap_rows]), width="stretch", hide_index=True)
+
+    with st.expander("📖 How this table is built"):
         st.markdown("""
-**Real daily trading volume — no ETF anywhere.** The `Volume Source` column shows each row's
-source:
+**One daily snapshot** (`index_snapshot.py`, run every day at 08:00 Hong Kong time). Every index
+uses its **latest completed session** — a market that is trading at that moment contributes its
+previous session. The table, the RSI chart, the alert email and the AI chat all read the same file.
 
-| Indices | Source | Unit |
-|---|---|---|
-| S&P 500, Nasdaq 100, Hang Seng, Nikkei 225, Topix, Taiwan, KOSPI 200, CSI 300/1000, ChiNext | the index ticker's **own aggregate volume** (sum of constituent shares traded), straight from the data feed | shares |
-| **SOX** | **Σ of its 30 constituents'** volume — `^SOX` reports no volume of its own | shares |
-| **Russell 2000** | **RTY=F futures** contract volume — `^RUT`'s reported volume is a yfinance bug (it returns `^GSPC`'s number) | contracts |
+| Column | How |
+|---|---|
+| Close, RSI(14) | Yahoo daily close (A-shares: Sina via AkShare); RSI computed locally on the same closes. **Topix** and **KOSPI 200**: TradingView's dated index snapshot (close + RSI) |
+| Volume | Σ of every constituent's share volume that day |
+| Turnover | Σ of every constituent's close × volume, in local currency; shown converted to USD |
+| Δ vs 20d / Alert | turnover of the latest session vs the **average of the 20 sessions before it**, in local currency (exchange-rate moves aren't trading activity). Alert at ±10% |
 
-**Units differ** (shares vs contracts, and shares mean different things across markets), so
-**don't compare the absolute `Volume` / `20d Avg` across rows** — only the per-row **`Δ vs 20d`**
-is meaningful, and that ratio is unit-agnostic.
+**Why constituent sums:** the "index volume" fields on Yahoo / Sina were checked against official
+figures and don't measure the index itself (^NDX and Sina's ChiNext report the whole exchange /
+board, ^GSPC is revised to a wider number overnight, ^N225 uses an unknown unit, RTY=F is futures).
+Σ constituents matched every official figure available (Nasdaq, CNI, CSIndex, TradingView).
 
-**Two correctness fixes:**
-- **Incomplete bars dropped** — a not-yet-settled last bar (< 40% of the recent median) is
-  excluded, so it can't fire a false `LOW` alert.
-- **Baseline excludes today** — today's value is compared against the *prior* 20-day average,
-  not an average that already contains it.
+**Turnover is close × volume**, an estimate — within ~2% of official turnover (checked on ChiNext,
+CSI 300, CSI 1000; the 20-day Δ matched official within 0.3 pts).
 
-*Why not "turnover" (volume × price)?* An index has no real per-share price (only a point
-level), so `level × volume` is a meaningless number. Real turnover needs summing every
-constituent's `price × volume`; trading **volume** is published directly and is the clean,
-ETF-free activity signal.
+**Constituent lists** are re-fetched every run from the index publisher, exchange or a
+tracking ETF's daily holdings (SPY, Nasdaq, Nasdaq index data for SOX, iShares/Vanguard for
+Russell, Nikkei, JPX, CSIndex, CNI, TWSE), so index reviews flow through automatically. Each
+run is compared with the last saved list; changes show in **Data check** and are logged to
+`data/constituent_changes.csv`.
+
+**Data checks** — any of these blanks the row's Δ and suppresses its alert:
+- the constituent list came from a fallback source (may be stale), or hasn't changed for longer
+  than the index's normal review cycle (the source may have stopped updating);
+- a session counts only if ≥ 90% of the listed constituents traded that day (latest day and
+  every day in the 20-day window), so holidays / partial downloads can't distort the average;
+- constituent list shorter than expected (a fallback source);
+- turnover identical to the previous session (feed duplicate) or < 40% of the 20-day median
+  (incomplete day).
+- **Hang Seng / KOSPI 200** (lists from Wikipedia — no official source): Yahoo's index volume
+  ÷ our constituent sum outside its normal band → the list is probably out of date.
 """)
 
     st.subheader("RSI History")
     pick = st.radio("Index", list(config.INDICES.keys()), horizontal=True, label_visibility="collapsed")
-    if pick in rsi_history:
-        # Compute RSI on the full fetched series (accurate warmup), then show
-        # only the most recent RSI_CHART_DAYS trading days.
-        s = rsi_history[pick].dropna().tail(config.RSI_CHART_DAYS)
+    hist = next((r.get("rsi_history") for r in snap_rows if r["Index"] == pick), None)
+    if hist and hist.get("values"):
         fig = go.Figure()
         fig.add_trace(go.Scatter(
-            x=s.index, y=s.values, name=f"{pick} RSI",
+            x=pd.to_datetime(hist["dates"]), y=hist["values"], name=f"{pick} RSI",
             hovertemplate="<b>%{x|%Y-%m-%d}</b><br>RSI: %{y:.1f}<extra></extra>",
         ))
         fig.add_hline(y=config.RSI_UPPER, line_dash="dash", line_color="red")
@@ -368,6 +393,11 @@ ETF-free activity signal.
         fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0), yaxis_range=[0, 100],
                          xaxis=dict(hoverformat="%Y-%m-%d", tickformat="%Y-%m-%d"))
         st.plotly_chart(fig, width="stretch")
+    elif pick in config.TV_SNAPSHOT_INDICES:
+        st.info(f"{pick} uses TradingView's daily index snapshot only — no index history is "
+                "available, and an ETF history is not substituted.")
+    else:
+        st.info(f"No RSI history for {pick} in this snapshot.")
 
 # ============ TAB 3 ============
 with tab3:
@@ -381,15 +411,16 @@ with tab3:
     def _fmt_pct(v):
         return f"{v:.1f}%" if v is not None else "—"
 
-    def _coverage_info(name: str, n: int):
+    def _coverage_info(name: str, n: int, n_list=None):
         """Return (sort_key, display_str, is_proxy).
 
-        Distinguishes three states so the table never just shows a bare blank:
+        Coverage = names with enough history for the 200-day MA ÷ the index's
+        current constituent list (same list as Tab 2). Three states:
           - n == 0        → constituent source unavailable (data feed down)
-          - pct < 85%     → partial list (flag as approximate)
+          - pct < 85%     → partial (flag as approximate)
           - pct >= 85%    → full coverage
         """
-        theo = config.INDEX_THEORETICAL_SIZE.get(name)
+        theo = n_list or config.INDEX_THEORETICAL_SIZE.get(name)
         if not theo:
             return (0, "—", False)
         if not n:
@@ -403,12 +434,14 @@ with tab3:
         return (pct, label, is_proxy)
 
     def _render_rows(cache_rows):
+        checks = {r["Index"]: _data_check(r, "data_notes")
+                  for r in index_snapshot.load().get("rows", [])}
+        order = {name: i for i, name in enumerate(config.INDICES)}
         rows = []
-        for r in cache_rows:
+        for r in sorted(cache_rows, key=lambda r: order.get(r["Index"], len(order))):
             n = r.get("n_stocks", 0) or 0
-            sort_key, cov_str, is_proxy = _coverage_info(r["Index"], n)
+            _, cov_str, is_proxy = _coverage_info(r["Index"], n, r.get("n_list"))
             rows.append({
-                "_sort": sort_key,
                 "Index": ("⚠️ " if is_proxy else "") + r["Index"],
                 "Coverage": cov_str,
                 "% > 50MA": _fmt_pct(r.get("pct_above_short")),
@@ -418,21 +451,22 @@ with tab3:
                 "% Up Today": _fmt_pct(r.get("pct_up")),
                 "% Down Today": _fmt_pct(r.get("pct_down")),
                 "As of": r.get("as_of") or "—",
+                "Data check": checks.get(r["Index"], "—"),
+                "Coverage note": r.get("coverage_note") or "—",
             })
-        # Sort by coverage descending
-        rows.sort(key=lambda r: r["_sort"], reverse=True)
-        df = pd.DataFrame(rows).drop(columns=["_sort"])
+        df = pd.DataFrame(rows)
         # Height fits all 12 indices + header without scroll
-        st.dataframe(df, width="stretch", hide_index=True, height=38 + 12 * 35)
+        st.dataframe(df, width="stretch", hide_index=True, height=38 + 12 * 35,
+                     column_config=_text_columns(df, ["Data check", "Coverage note"]))
         st.caption(
-            "**Coverage** = constituents fetched ÷ index theoretical size. "
-            "All 12 indices ≥ 86% covered. Missing stocks are usually recently-listed "
-            "ones that don't have 200 days of history yet (excluded from MA computation)."
+            "**Coverage** = constituents with 200 days of price history ÷ the index's current "
+            "constituent list — the same list and download as Tab 2's volume / turnover. "
+            "**Coverage note** explains every name not counted (generated from the data each run)."
         )
         st.caption(
-            "**As of** = trading date of underlying close prices. Different markets close on "
-            "different days due to local holidays / time zones (e.g. US data may be 1 day "
-            "older than HK data depending on weekday)."
+            "**As of** = the latest completed trading session (same date as Tab 2's turnover). "
+            "Markets differ by local holidays and time zones. **Data check** = the same "
+            "constituent-list checks as Tab 2 (details in Tab 2's notes)."
         )
 
     # Read cache file populated by update_cache.py (cron / launchd job)
@@ -457,15 +491,6 @@ with tab3:
                 f"{computed_at.strftime('%Y-%m-%d %H:%M ET')}. The scheduled job may have failed."
             )
         _render_rows(cache_data["rows"])
-        st.caption(
-            "**Coverage** = constituents fetched ÷ index theoretical size. "
-            "All 12 indices ≥ 86% covered (most ≥ 95%). Missing stocks are recent IPOs "
-            "without 200-day history."
-        )
-        st.caption(
-            "**As of** = trading date of underlying close prices. Different markets close "
-            "on different days due to local holidays / time zones."
-        )
 
         # ---- 30-day Advance/Decline chart ----
         st.markdown("---")
@@ -537,45 +562,11 @@ with tab3:
             "Schedule it via cron / launchd to refresh daily — see deploy notes."
         )
 
-    # Manual refresh button (also useful if cache is stale and you can't wait for cron)
-    with st.expander("⚙️ Manual recompute (only if cron job hasn't run yet)"):
-        if st.button("Recompute now (3–8 minutes)"):
-            with st.spinner("Computing breadth for 12 indices..."):
-                rows = []
-                for name in config.INDICES:
-                    fetcher = data.CONSTITUENT_FETCHERS.get(name)
-                    if fetcher is None:
-                        continue
-                    tickers = fetcher()
-                    if not tickers:
-                        continue
-                    closes = data.fetch_batch_close(tickers, days=500)
-                    br = indicators.breadth_above_both_ma(closes, config.MA_SHORT, config.MA_LONG)
-                    ad = indicators.daily_advance_decline(closes)
-                    as_of = closes.index[-1].strftime("%Y-%m-%d") if not closes.empty else None
-                    rows.append({
-                        "Index": name, "as_of": as_of,
-                        "pct_above_short": br["pct_above_short"] if pd.notna(br["pct_above_short"]) else None,
-                        "pct_above_long":  br["pct_above_long"]  if pd.notna(br["pct_above_long"])  else None,
-                        "pct_above_both":  br["pct_above_both"]  if pd.notna(br["pct_above_both"])  else None,
-                        "pct_below_both":  br["pct_below_both"]  if pd.notna(br["pct_below_both"])  else None,
-                        "pct_up":          ad["pct_up"]          if pd.notna(ad["pct_up"])          else None,
-                        "pct_down":        ad["pct_down"]        if pd.notna(ad["pct_down"])        else None,
-                        "n_stocks": br["n_stocks"],
-                    })
-                CACHE_FILE.parent.mkdir(exist_ok=True)
-                CACHE_FILE.write_text(json.dumps({
-                    "computed_at_et": datetime.now(ET).isoformat(),
-                    "rows": rows,
-                }, indent=2, default=str))
-                st.success("Done. Refresh the page to see updated data.")
-                st.rerun()
-
 # ============ TAB 4 ============
 with tab4:
     st.subheader("S&P 500 Put / Call Ratio")
     st.caption(
-        "📅 Live during US market hours, frozen after 16:00 ET close.  \n"
+        "Scheduled SPX data snapshot — not a live feed.  \n"
         "Source: [barchart.com/stocks/quotes/\\$SPX/put-call-ratios]"
         "(https://www.barchart.com/stocks/quotes/$SPX/put-call-ratios)"
     )
@@ -591,8 +582,12 @@ with tab4:
             except Exception:
                 asof_display = str(pc["asof"])
         st.caption(
-            f"As of: **{asof_display or 'unknown'}**  ·  Source: **{pc.get('source', 'unknown')}**"
+            f"Fetched at: **{asof_display or 'unknown'}**  ·  Source: **{pc.get('source', 'unknown')}**"
         )
+
+        st.caption("Fetch time is not the exchange observation time. Refresh this page after a sync.")
+        if pc.get("stale"):
+            st.warning("Update overdue: this snapshot was fetched more than 96 hours ago. Showing last validated SPX data.")
 
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -611,7 +606,7 @@ with tab4:
             st.metric("Source", pc.get("source", "unknown"), help="Auto-scraped, refreshed by daily cron")
 
         # Volume / OI summary
-        st.write("**Aggregate (next 4 expirations):**")
+        st.write("**Barchart SPX reported totals:**")
         summary = pd.DataFrame([{
             "Total Call Volume": f"{pc['total_call_vol']:,}",
             "Total Put Volume":  f"{pc['total_put_vol']:,}",
@@ -629,34 +624,22 @@ with tab4:
             "• **OI P/C** shows accumulated positioning over time"
         )
     else:
-        st.warning("Could not fetch SPY options data. Manual references:")
+        st.warning("Validated SPX data is unavailable. SPY is not substituted. Source references:")
         st.markdown(
             "- https://www.barchart.com/stocks/quotes/\\$SPX/put-call-ratios\n"
             "- https://en.macromicro.me/collections/34/us-stock-relative/449/us-cboe-options-put-call-ratio\n"
             "- https://www.cboe.com/us/options/market_statistics/daily/"
         )
 
-    # ---- Barchart's actual chart, captured server-side via Playwright ----
-    st.markdown("---")
-    st.subheader("📈 SPX vs. Put/Call Ratios — Historical Chart")
-    st.caption(
-        "Live snapshot of Barchart's official chart "
-        "(stock price + Volume Ratio + Open Interest Ratio over the last ~10 months). "
-        "Updated daily at 8:00 PM ET."
+    st.markdown(
+        "### [View on Barchart ↗]"
+        "(https://www.barchart.com/stocks/quotes/$SPX/put-call-ratios)"
     )
-    chart_path = data.fetch_barchart_pc_chart()
-    if chart_path:
-        st.image(chart_path, width="stretch")
-    else:
-        st.warning(
-            "Could not capture Barchart chart. Open it directly: "
-            "[barchart.com](https://www.barchart.com/stocks/quotes/$SPX/put-call-ratios)"
-        )
 
 
 # ============ AI ANALYSIS SIDEBAR ============
 def _build_ai_snapshot():
-    """Assemble a cross-tab snapshot for the AI chat from cache + cached live data."""
+    """Assemble a cross-tab snapshot for the AI chat from the daily-run files."""
     snap = {}
     # Tab 3 — breadth from the daily cache
     if CACHE_FILE.exists():
@@ -668,7 +651,7 @@ def _build_ai_snapshot():
     snap["tab2_rows"] = st.session_state.get("ai_tab2_rows", [])
     # Tab 1 — VIX, put/call, AAII (all @st.cache_data → cheap on rerun)
     try:
-        vix = data.fetch_yf_history(config.VIX_TICKER, days=60)
+        vix = data.load_market_series(config.VIX_TICKER)
         if not vix.empty:
             snap["vix_close"] = float(vix["Close"].iloc[-1])
     except Exception:

@@ -6,7 +6,7 @@ on:
   # 我们用 EDT 时间: 11:30 AM ET = 15:30 UTC; 19:00 ET = 23:00 UTC
   schedule:
     - cron: '30 15 * * 4'    # AAII: Thursday 11:30 AM ET
-    - cron: '0 23 * * 1-5'   # Barchart: Mon-Fri 7:00 PM ET
+    - cron: '0 23 * * *'   # Barchart: Mon-Fri 7:00 PM ET
   workflow_dispatch:  # 允许手动触发测试
 
 jobs:
@@ -64,7 +64,7 @@ jobs:
           ssh root@${{ secrets.SERVER_IP }} "sudo -u rays /opt/rays/venv/bin/python3 /tmp/notify_failure.py 'fetch-aaii' 'https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'"
 
   fetch-barchart:
-    if: github.event.schedule == '0 23 * * 1-5' || github.event_name == 'workflow_dispatch'
+    if: github.event.schedule == '0 23 * * *' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Setup Playwright

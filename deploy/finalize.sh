@@ -21,10 +21,10 @@ systemctl start streamlit
 # nginx is shared with etf-tracker and lives outside this repo
 # (final/server/nginx.conf → /etc/nginx/sites-enabled/rays). Install it separately.
 
-echo "==> Installing daily refresh timer (08:00 Hong Kong time)..."
-cp /opt/rays/deploy/rays-daily.service /opt/rays/deploy/rays-daily.timer /etc/systemd/system/
+echo "==> Installing refresh timers (19:00 prefetch / 20:00 validation, New York)..."
+cp /opt/rays/deploy/rays-daily.service /opt/rays/deploy/rays-daily.timer /opt/rays/deploy/rays-prefetch.service /opt/rays/deploy/rays-prefetch.timer /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now rays-daily.timer
+systemctl enable --now rays-daily.timer rays-prefetch.timer
 systemctl list-timers rays-daily.timer --no-pager
 
 echo ""

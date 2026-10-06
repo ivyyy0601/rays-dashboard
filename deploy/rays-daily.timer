@@ -1,18 +1,7 @@
-# Triggers rays-daily.service every day at 08:00 Hong Kong time (fixed in HKT,
-# so US daylight-saving changes don't move it). At that hour the US session has
-# closed; every index uses its latest completed session — a market already
-# trading (Tokyo / Seoul open at 08:00 HKT) contributes its previous session.
-#
-# Server path: /etc/systemd/system/rays-daily.timer
-# Next run: systemctl list-timers rays-daily.timer
-
 [Unit]
-Description=Rays daily refresh 08:00 Hong Kong time
-
+Description=Rays validation and publication daily at 20:00 New York time
 [Timer]
-OnCalendar=*-*-* 08:00:00 Asia/Hong_Kong
-# If the server was off at trigger time, run as soon as it's back up
+OnCalendar=*-*-* 20:00:00 America/New_York
 Persistent=true
-
 [Install]
 WantedBy=timers.target

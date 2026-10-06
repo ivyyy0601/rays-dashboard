@@ -78,28 +78,58 @@ def build_snapshot() -> dict:
 
     # Tab 2: RSI + turnover Δ from the daily index snapshot (same file as the
     # dashboard table). A row that failed its data checks carries no Δ.
-    idx_snap = index_snapshot.load() or index_snapshot.build_and_save()
+    from reliability import validate_row, expected_session
+    idx_snap = index_snapshot.load()
+    now = datetime.now(ET)
+    for r in idx_snap.get('rows', []):
+        validate_row(r, now)
+    snapshot['data_warnings'] = [r['Index'] + ': ' + '; '.join(r.get('notes', []))
+                                 for r in idx_snap.get('rows', []) if not r.get('data_ok')]
+    if not idx_snap.get('rows'):
+        snapshot['data_warnings'].append('Index snapshot unavailable; no index signals evaluated')
+    try:
+        target = expected_session('S&P 500', now)
+        if vix.empty or vix.index[-1].strftime('%Y-%m-%d') != target:
+            snapshot['vix_close'] = None
+            snapshot.pop('gld_vix_momentum_10w', None)
+            snapshot['data_warnings'].append('VIX data is not from latest completed US session')
+        if gld.empty or gld.index[-1].strftime('%Y-%m-%d') != target:
+            snapshot.pop('gld_vix_momentum_10w', None)
+            snapshot['data_warnings'].append('GLD data is not from latest completed US session')
+    except Exception as exc:
+        snapshot['vix_close'] = None
+        snapshot.pop('gld_vix_momentum_10w', None)
+        snapshot['data_warnings'].append(f'US calendar validation unavailable: {exc}')
     tab2_rows = []
     for r in idx_snap.get("rows", []):
         dev = r.get("turnover_dev")
         tab2_rows.append({
             "Index": r["Index"],
-            "RSI(14)": f"{r['rsi']:.1f}" if r.get("rsi") is not None else "—",
-            "Turnover (USD)": f"${r['turnover_usd'] / 1e9:,.1f}B" if r.get("turnover_usd") else "—",
+            "RSI(14)": f"{r['rsi']:.1f}" if r.get("rsi") is not None and r.get('price_fresh') else "—",
+            "Turnover (USD)": f"${r['turnover_usd'] / 1e9:,.1f}B" if r.get("turnover_usd") and r.get('data_ok') else "—",
             "Δ vs 20d": f"{dev:+.1f}%" if (dev is not None and r.get("data_ok")) else "—",
         })
     snapshot["tab2_rows"] = tab2_rows
 
     # Breadth — read from cache (already computed by update_cache.py)
-    if CACHE_FILE.exists():
-        try:
-            cache = json.loads(CACHE_FILE.read_text())
-            snapshot["breadth_rows"] = cache.get("rows", [])
-        except Exception:
-            pass
+    snapshot['breadth_rows'] = [dict(Index=r['Index'], **r['breadth'])
+                                for r in idx_snap.get('rows', [])
+                                if r.get('data_ok') and r.get('breadth')]
 
     # Put/Call
-    snapshot["putcall"] = data.fetch_putcall_ratio() or {}
+    pc = data.fetch_putcall_ratio() or {}
+    if pc:
+        try:
+            target = expected_session('S&P 500', now)
+            fetched = datetime.fromisoformat(pc['asof'].replace('Z', '+00:00'))
+            if fetched.tzinfo is None or pc.get('stale') or fetched.astimezone(ET).date().isoformat() < target:
+                raise ValueError('source retrieval predates latest completed US session')
+        except Exception as exc:
+            snapshot['data_warnings'].append(f'SPX put/call withheld: {exc}')
+            pc = {}
+    else:
+        snapshot['data_warnings'].append('SPX put/call snapshot unavailable')
+    snapshot['putcall'] = pc
 
     return snapshot
 
@@ -185,6 +215,10 @@ def main():
           f"breadth_rows={len(snapshot.get('breadth_rows', []))}")
 
     triggered = alerts.check_all_alerts(snapshot)
+    if snapshot.get('data_warnings'):
+        import html
+        triggered.append({'severity': 'info', 'title': '⚠️ Data quality warning — affected signals withheld',
+                          'message': html.escape(' | '.join(snapshot['data_warnings']))})
     print(f"  {len(triggered)} alert(s) triggered.")
     for a in triggered:
         print(f"    [{a['severity']}] {a['title']}")
@@ -207,8 +241,7 @@ def main():
         return
 
     if not EMAIL_CONFIG.exists():
-        print(f"  ⚠️  {EMAIL_CONFIG} not found — see email_config.example.json. Skipping email.")
-        return
+        raise RuntimeError('Email configuration missing; daily email was not sent')
 
     cfg = json.loads(EMAIL_CONFIG.read_text())
     text_body, html_body = format_email(triggered, ts, ai_summary=ai_summary)
@@ -220,6 +253,7 @@ def main():
         print(f"  ✓ Email sent to {cfg['to_emails']}")
     except Exception as e:
         print(f"  ✗ Email send failed: {e}")
+        raise
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 """
-Daily wrapper: update cache + run alert checks.
+Daily wrapper: update cache + run alert checks (reliability review).
 Called by launchd at 5:30 AM ET. Calling Python directly (not bash) avoids
 macOS TCC restrictions on Desktop folder access for /bin/bash.
 """
@@ -12,11 +12,7 @@ ROOT = Path(__file__).parent.resolve()
 os.chdir(ROOT)
 sys.path.insert(0, str(ROOT))
 
-import update_cache
-import check_alerts
+from daily_pipeline import main
 
-print(f"\n{'=' * 60}\nDaily run starting\n{'=' * 60}")
-update_cache.main()
-print(f"\n{'=' * 60}\nAlert check\n{'=' * 60}")
-check_alerts.main()
-print(f"\n{'=' * 60}\nDone\n{'=' * 60}")
+if __name__ == '__main__':
+    raise SystemExit(main())

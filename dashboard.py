@@ -19,9 +19,16 @@ import ai_analysis
 
 ET = ZoneInfo("America/New_York")
 CACHE_FILE = Path(__file__).parent / "data" / "breadth_cache.json"
+PAGE_INDEX_SNAPSHOT = index_snapshot.load()
+PAGE_BREADTH_CACHE = {
+    'computed_at_et': PAGE_INDEX_SNAPSHOT.get('validated_at_et') or PAGE_INDEX_SNAPSHOT.get('built_at_et'),
+    'rows': [dict(Index=r['Index'], **r['breadth'], n_list=r.get('constituents'),
+                  list_source=r.get('list_source'))
+             for r in PAGE_INDEX_SNAPSHOT.get('rows',[]) if r.get('breadth')],
+}
 
-# No live fetching: every tab reads files written by the daily run (08:00 HKT,
-# systemd rays-daily.timer) or pushed by GitHub Actions (AAII, Barchart).
+# No live fetching: 19:00 ET prefetch, 20:00 ET validation/publication,
+# or separate GitHub Actions feeds (AAII, Barchart).
 
 st.set_page_config(page_title="Market Sentiment Dashboard", layout="wide")
 
@@ -67,8 +74,8 @@ else:
 
 st.caption(
     f"🕐 **Page opened: {now_str} ET**  ·  "
-    f"📦 **Breadth cache written: {last_update_str}** — refreshed once a day at 08:00 Hong Kong "
-    f"time for index analytics. Individual panels show their own observation or retrieval dates; "
+    f"📦 **Breadth cache written: {last_update_str}** — prefetch at 19:00 ET; validation starts at 20:00 ET. "
+    f"Publication and email follow validation; incomplete data is flagged. Panels show their own observation or retrieval dates; "
     f"AAII and options follow separate source schedules."
 )
 
@@ -108,7 +115,7 @@ def _data_check(r, notes_key="notes"):
 with tab1:
     # ---- VIX ----
     st.subheader("VIX")
-    st.caption("📅 From the daily 08:00 HKT run — latest completed US session")
+    st.caption("📅 From the daily validated snapshot — check the observation date for freshness")
     vix = data.load_market_series(config.VIX_TICKER)
     vix = vix[vix.index >= vix.index.max() - pd.Timedelta(days=config.HISTORY_DAYS)] if not vix.empty else vix
     if not vix.empty:
@@ -139,7 +146,7 @@ with tab1:
     # ---- GLD/VIX 10-week momentum (Zac Markovich's contrarian bottom signal) ----
     st.subheader("GLD / VIX — Weekly 10-Period Momentum")
     st.caption(
-        "📅 From the daily 08:00 HKT run (weekly bars per Zac Markovich's note; the current "
+        "📅 From the daily validated snapshot (weekly bars per Zac Markovich's note; the current "
         "week's bar updates with each new completed US session)"
     )
     st.caption(
@@ -257,17 +264,21 @@ with tab1:
 # ============ TAB 2 ============
 with tab2:
     st.subheader("RSI & Turnover by Index")
-    snap = index_snapshot.load()
+    st.caption("Data checks cover freshness/completeness, not independent certification. "
+               "ETF/Wikipedia constituent lists are proxies; official daily membership and "
+               "independent price/volume reconciliation remain unverified. "
+               "Historical comparisons use the selected current list, not historical index membership.")
+    snap = PAGE_INDEX_SNAPSHOT
     snap_rows = snap.get("rows", [])
     if not snap_rows:
         st.warning("The daily index snapshot hasn't been built yet. "
-                   "Run `python index_snapshot.py` (the daily 08:00 HKT job does this automatically).")
+                   "The scheduled pipeline prefetches at 19:00 ET and validates/publishes from 20:00 ET.")
     else:
         built = pd.to_datetime(snap["built_at_et"]).strftime("%Y-%m-%d %H:%M ET")
         st.caption(
             f"📸 Daily snapshot built **{built}**. Price and activity dates are shown per row "
             "(nothing is fetched live). **Volume** and **Turnover** sum the available data for the selected constituent list; "
-            "turnover = Σ close × volume, shown in USD. "
+            "Estimated turnover = Σ close × volume, shown in USD (not actual executed trading value). "
             "**Δ vs 20d** and **Alert** use turnover: the latest session vs the average of the "
             "20 sessions before it (local currency)."
         )
@@ -345,7 +356,7 @@ with tab2:
 
     with st.expander("📖 How this table is built"):
         st.markdown("""
-**One daily snapshot** (`index_snapshot.py`, run every day at 08:00 Hong Kong time). Every index
+**One daily snapshot** (19:00 ET prefetch; 20:00 ET validation, then publication). Every index
 uses its **latest completed session** — a market that is trading at that moment contributes its
 previous session. The table, the RSI chart, the alert email and the AI chat all read the same file.
 
@@ -438,7 +449,7 @@ with tab3:
 
     def _render_rows(cache_rows):
         checks = {r["Index"]: _data_check(r, "data_notes")
-                  for r in index_snapshot.load().get("rows", [])}
+                  for r in PAGE_INDEX_SNAPSHOT.get("rows", [])}
         order = {name: i for i, name in enumerate(config.INDICES)}
         rows = []
         for r in sorted(cache_rows, key=lambda r: order.get(r["Index"], len(order))):
@@ -473,12 +484,7 @@ with tab3:
         )
 
     # Read cache file populated by update_cache.py (cron / launchd job)
-    cache_data = None
-    if CACHE_FILE.exists():
-        try:
-            cache_data = json.loads(CACHE_FILE.read_text())
-        except Exception:
-            cache_data = None
+    cache_data = PAGE_BREADTH_CACHE
 
     if cache_data and cache_data.get("rows"):
         computed_at = datetime.fromisoformat(cache_data["computed_at_et"])
@@ -645,13 +651,12 @@ def _build_ai_snapshot():
     """Assemble a cross-tab snapshot for the AI chat from the daily-run files."""
     snap = {}
     # Tab 3 — breadth from the daily cache
-    if CACHE_FILE.exists():
-        try:
-            snap["breadth_rows"] = json.loads(CACHE_FILE.read_text()).get("rows", [])
-        except Exception:
-            pass
+    valid_indices = {r['Index'] for r in PAGE_INDEX_SNAPSHOT.get('rows',[]) if r.get('data_ok')}
+    snap['breadth_rows'] = [r for r in PAGE_BREADTH_CACHE['rows'] if r['Index'] in valid_indices]
+    snap['data_warnings'] = [r['Index'] + ': ' + '; '.join(r.get('notes',[]))
+                             for r in PAGE_INDEX_SNAPSHOT.get('rows',[]) if not r.get('data_ok')]
     # Tab 2 — RSI + volume Δ captured during this run's render
-    snap["tab2_rows"] = st.session_state.get("ai_tab2_rows", [])
+    snap["tab2_rows"] = [r for r in st.session_state.get("ai_tab2_rows", []) if r.get('Index') in valid_indices]
     # Tab 1 — VIX, put/call, AAII (all @st.cache_data → cheap on rerun)
     try:
         vix = data.load_market_series(config.VIX_TICKER)

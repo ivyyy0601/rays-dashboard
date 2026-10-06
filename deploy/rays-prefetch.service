@@ -1,7 +1,8 @@
 [Unit]
-Description=Rays validate, publish and email daily snapshot
+Description=Rays daily data prefetch (no email)
 After=network-online.target
 Wants=network-online.target
+
 [Service]
 Type=oneshot
 User=rays
@@ -9,7 +10,7 @@ Group=rays
 WorkingDirectory=/opt/rays
 Environment=TZ=America/New_York
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/rays/venv/bin/python /opt/rays/run_daily.py
-TimeoutStartSec=35min
+ExecStart=/opt/rays/venv/bin/python /opt/rays/run_daily.py --prefetch
+TimeoutStartSec=57min
 StandardOutput=append:/opt/rays/data/cron.log
 StandardError=append:/opt/rays/data/cron.log

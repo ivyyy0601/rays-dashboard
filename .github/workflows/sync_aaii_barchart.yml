@@ -6,7 +6,7 @@ on:
   # 我们用 EDT 时间: 11:30 AM ET = 15:30 UTC; 19:00 ET = 23:00 UTC
   schedule:
     - cron: '30 15 * * 4'    # AAII: Thursday 11:30 AM ET
-    - cron: '0 23 * * *'   # Barchart: Mon-Fri 7:00 PM ET
+    - cron: '0 23 * * *'   # Barchart: daily 19:00 EDT / 18:00 EST
   workflow_dispatch:  # 允许手动触发测试
 
 jobs:
@@ -16,6 +16,7 @@ jobs:
   fetch-aaii:
     if: github.event.schedule == '30 15 * * 4' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Fetch AAII
         run: |
@@ -66,6 +67,7 @@ jobs:
   fetch-barchart:
     if: github.event.schedule == '0 23 * * *' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Setup Playwright
         run: |
@@ -120,7 +122,17 @@ jobs:
               put_oi = grab(r'Put Open Interest Total')
               call_oi = grab(r'Call Open Interest Total')
 
-              if vol_pc and oi_pc:
+              if all(v is not None for v in (vol_pc, oi_pc, put_vol, call_vol, put_oi, call_oi)):
+                  import math
+                  values = [float(v) for v in (vol_pc, oi_pc, put_vol, call_vol, put_oi, call_oi)]
+                  if not all(math.isfinite(v) and v >= 0 for v in values):
+                      raise ValueError('Invalid Barchart numeric values')
+                  if float(call_vol) <= 0 or float(call_oi) <= 0:
+                      raise ValueError('Missing or zero call denominator')
+                  if abs(float(put_vol)/float(call_vol)-float(vol_pc)) > 0.02:
+                      raise ValueError('Volume ratio does not match totals')
+                  if abs(float(put_oi)/float(call_oi)-float(oi_pc)) > 0.02:
+                      raise ValueError('OI ratio does not match totals')
                   out = {
                       "source": "Barchart $SPX (via GitHub Actions)",
                       "vol_ratio": float(vol_pc),
@@ -136,7 +148,7 @@ jobs:
                       json.dump(out, f, indent=2)
                   print(f'✓ Numbers scraped: vol={vol_pc}, oi={oi_pc}')
               else:
-                  print(f'⚠️ Failed to scrape numbers: vol_pc={vol_pc}, oi_pc={oi_pc}')
+                  raise RuntimeError('Incomplete Barchart numeric scrape; refusing successful empty update')
               browser.close()
           EOF
           ls -la barchart_pc.* 2>/dev/null || echo "⚠️ No chart files found"

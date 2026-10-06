@@ -32,6 +32,7 @@ unchanged for longer than the index's normal review cycle, is flagged.
 Run standalone:  python index_snapshot.py
 """
 import json
+import os
 import sys
 import types
 from datetime import datetime, timedelta, timezone
@@ -56,10 +57,12 @@ import yfinance as yf
 import config
 import data
 import indicators
+from reliability import expected_session, validate_row, atomic_json, calendar, missing_bars, retain_dated_price
 
 ET = ZoneInfo("America/New_York")
-SNAPSHOT_FILE = Path(__file__).parent / "data" / "index_snapshot.json"
-MARKET_FILE = Path(__file__).parent / "data" / "market_series.json"
+OUTPUT_DIR = Path(os.environ.get('RAYS_OUTPUT_DIR', str(Path(__file__).parent / 'data')))
+SNAPSHOT_FILE = OUTPUT_DIR / "index_snapshot.json"
+MARKET_FILE = OUTPUT_DIR / "market_series.json"
 LIST_DIR = Path(__file__).parent / "data" / "constituents"
 CHANGE_LOG = Path(__file__).parent / "data" / "constituent_changes.csv"
 INCOMPLETE_RATIO = 0.4   # latest turnover < 40% of the 20-day median → incomplete day
@@ -211,7 +214,14 @@ def _constituent_activity(name: str, tickers: list, now: datetime) -> dict:
     """Σ constituents' daily volume and turnover (close × volume, local currency).
     Uses the shared Yahoo download (data.yf_daily) that breadth reuses later in
     the same cron run — 500 days so breadth's 200-day MAs need no second request."""
-    bars = data.yf_daily(tickers, days=500)
+    try:
+        target = expected_session(name, now)
+        sessions = calendar(name, now.year).sessions_in_range(pd.Timestamp(target)-pd.Timedelta(days=60),target)[-21:]
+    except Exception as exc:
+        target = None
+        sessions = None
+        print(f'Calendar unavailable for {name}: {exc}', flush=True)
+    bars = data.yf_daily(tickers, days=500, expected_date=target, expected_sessions=sessions)
     if not bars:
         empty = pd.Series(dtype=float)
         return {"volume": empty, "turnover": empty, "traded": empty,
@@ -235,17 +245,17 @@ def _coverage_note(tickers: list, closes: pd.DataFrame) -> str:
         first = closes[t].first_valid_index()
         if first is None:
             no_data.append(t)
-        elif len(closes.loc[first:]) < config.MA_LONG:
+        elif closes[t].notna().sum() < config.MA_LONG:
             young[t] = first
     strip = lambda t: t.split(".")[0]
     parts = []
     if young:
         names = ", ".join(f"{strip(t)} (since {d:%Y-%m-%d})"
                           for t, d in sorted(young.items(), key=lambda kv: kv[1])[:5])
-        parts.append(f"{len(young)} listed < {config.MA_LONG} trading days ago, so no "
+        parts.append(f"{len(young)} have fewer than {config.MA_LONG} observed price bars, so no "
                      f"{config.MA_LONG}-day MA yet: {names}{' …' if len(young) > 5 else ''}")
     if no_data:
-        parts.append(f"{len(no_data)} with no Yahoo price data (renamed, merged or delisted?): "
+        parts.append(f"{len(no_data)} with no Yahoo price data (cause unverified): "
                      f"{', '.join(strip(t) for t in no_data[:5])}{' …' if len(no_data) > 5 else ''}")
     return "; ".join(parts) or "All constituents counted"
 
@@ -259,10 +269,10 @@ def _turnover_note(tickers: list, volumes: pd.DataFrame, day) -> str:
     idle = [t for t in volumes.columns if not on_day.get(t, 0) > 0]
     parts = []
     if idle:
-        parts.append(f"{len(idle)} with no trading volume on {day:%Y-%m-%d} (suspended / halted?): "
+        parts.append(f"{len(idle)} with zero or missing reported volume on {day:%Y-%m-%d} (cause unverified): "
                      f"{', '.join(strip(t) for t in idle[:5])}{' …' if len(idle) > 5 else ''}")
     if no_data:
-        parts.append(f"{len(no_data)} with no Yahoo data (renamed, merged or delisted?): "
+        parts.append(f"{len(no_data)} with no Yahoo data (cause unverified): "
                      f"{', '.join(strip(t) for t in no_data[:5])}{' …' if len(no_data) > 5 else ''}")
     return "; ".join(parts) or "All constituents counted"
 
@@ -271,8 +281,7 @@ def _breadth_block(closes: pd.DataFrame, full_sessions: pd.Index, latest, ticker
     """Moving-average breadth and advance/decline from the same closes, up to the
     same latest session as turnover. Recent sessions that failed the coverage
     check are dropped so a partial day can't skew % up / down."""
-    recent = closes.index[closes.index >= full_sessions.min()]
-    closes = closes.drop(recent.difference(full_sessions))
+    # Volume coverage must never remove valid price sessions from the MA window.
     closes = closes[closes.index <= latest]
     br = indicators.breadth_above_both_ma(closes, config.MA_SHORT, config.MA_LONG)
     ad = indicators.daily_advance_decline(closes)
@@ -308,6 +317,9 @@ def _activity_block(name: str, now: datetime, notes: list) -> dict:
     act = _constituent_activity(name, tickers, now)
     n_list = act["n_list"]
     out = {"constituents": n_list, "data_ok": True, **tracked}
+    if name == 'Taiwan' and {'0053.TW', '0056.TW'}.intersection(tickers):
+        notes.append('TAIEX membership unverified: list includes ETFs (TWSE classifies 0053/0056 as ETFs); signals withheld')
+        out['data_ok'] = False
     # A fallback or stale list means the sum may not be the index → no alert
     if "fallback" in (tracked.get("list_source") or "") or any("unchanged for" in n for n in notes):
         out["data_ok"] = False
@@ -344,6 +356,29 @@ def _activity_block(name: str, now: datetime, notes: list) -> dict:
         notes.append("turnover < 40% of the 20-day median — likely an incomplete day")
         out["data_ok"] = False
 
+    latest_day = turn.index[-1]
+    incomplete = missing_bars(act['closes'], act['volumes'], tickers, turn.index[-(WINDOW+1):])
+    out['missing_comparison_bars'] = incomplete
+    if incomplete:
+        notes.append(f'{incomplete} missing/invalid constituent bars in latest + prior 20 sessions; comparison provisional')
+        out['data_ok'] = False
+    latest_values = act['volumes'].reindex(columns=tickers).loc[latest_day]
+    latest_closes = act['closes'].reindex(columns=tickers).loc[latest_day]
+    missing = latest_values.isna() | latest_closes.isna() | (latest_values < 0)
+    if missing.any():
+        notes.append(f'incomplete constituent data: {int(missing.sum())}/{n_list} missing or invalid; '
+                     + ', '.join(missing.index[missing][:20]))
+        out['data_ok'] = False
+    try:
+        cal = calendar(name, now.year)
+        expected_window = cal.sessions_in_range(prior.index[0], latest_day)
+        actual_dates = list(turn.index[-(WINDOW+1):].strftime('%Y-%m-%d'))
+        if list(expected_window.strftime('%Y-%m-%d')) != actual_dates:
+            notes.append('20-day baseline skips exchange sessions; alert suppressed')
+            out['data_ok'] = False
+    except Exception as exc:
+        notes.append(f'20-day calendar check unavailable: {exc}')
+        out['data_ok'] = False
     currency = config.INDEX_CURRENCY[name]
     out.update({
         "activity_date": _fmt_date(turn.index[-1]),
@@ -399,7 +434,7 @@ def build_row(name: str, now: datetime, price: dict, notes: list) -> dict:
     pdate, adate = row.get("price_date"), row.get("activity_date")
     if pdate and adate and pdate != adate:
         notes.append(f"close is from {pdate} but volume/turnover from {adate}")
-    return row
+    return validate_row(row, now)
 
 
 def build(now: datetime = None) -> dict:
@@ -408,6 +443,14 @@ def build(now: datetime = None) -> dict:
     # downloads (~10 min on the server). Every value is the latest *completed*
     # session; a market trading at run time contributes its previous session.
     prices, notes = {}, {}
+    previous = {}
+    # Prefer the 19:00 staging snapshot; use published prices only if their
+    # observed date is still exactly the expected completed session.
+    for path in [Path(__file__).parent/'data/index_snapshot.json', SNAPSHOT_FILE]:
+        try:
+            previous.update({r['Index']:r for r in json.loads(path.read_text()).get('rows',[])})
+        except (OSError,ValueError,KeyError):
+            pass
     for name in config.INDICES:
         notes[name] = []
         try:
@@ -415,6 +458,13 @@ def build(now: datetime = None) -> dict:
         except Exception as e:
             prices[name] = {}
             notes[name].append(f"price fetch failed: {e}")
+        try:
+            target = expected_session(name, now)
+            prices[name], retained = retain_dated_price(prices[name], previous.get(name,{}), target)
+            if retained:
+                notes[name].append(f'Retained previously saved dated price for {target}; new fetch missing/stale/undated')
+        except Exception:
+            pass  # validate_row will fail closed if the calendar is unavailable.
     rows = []
     for name in config.INDICES:
         print(f"  {name}...", flush=True)
@@ -448,8 +498,8 @@ def save_market_series(now: datetime) -> None:
                                           "S&P 500", now=now)
         series[ticker] = {"dates": [_fmt_date(d) for d in close.index],
                           "close": [round(float(v), 4) for v in close.values]}
-    MARKET_FILE.write_text(json.dumps({"built_at_et": now.astimezone(ET).isoformat(timespec="seconds"),
-                                       "series": series}))
+    atomic_json(MARKET_FILE, {"built_at_et": now.astimezone(ET).isoformat(timespec="seconds"),
+                             "series": series})
     print(f"✓ Saved VIX / GLD ({series[config.VIX_TICKER]['dates'][-1]}) → {MARKET_FILE}")
 
 
@@ -458,7 +508,7 @@ def build_and_save(now: datetime = None) -> dict:
     save_market_series(now)
     snap = build(now)
     SNAPSHOT_FILE.parent.mkdir(exist_ok=True)
-    SNAPSHOT_FILE.write_text(json.dumps(snap, indent=2, default=str))
+    atomic_json(SNAPSHOT_FILE, snap)
     print(f"✓ Saved index snapshot → {SNAPSHOT_FILE}")
     return snap
 
@@ -473,9 +523,8 @@ def save_breadth_cache(snap: dict) -> None:
             continue
         rows.append({"Index": r["Index"], **b, "n_list": r.get("constituents"),
                      "list_source": r.get("list_source")})
-    cache = Path(__file__).parent / "data" / "breadth_cache.json"
-    cache.write_text(json.dumps({"computed_at_et": datetime.now(ET).isoformat(),
-                                 "rows": rows}, indent=2, default=str))
+    cache = OUTPUT_DIR / "breadth_cache.json"
+    atomic_json(cache, {"computed_at_et": datetime.now(ET).isoformat(), "rows": rows})
     print(f"✓ Saved breadth for {len(rows)} indices → {cache}")
 
 

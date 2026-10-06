@@ -14,3 +14,4 @@ streamlit-autorefresh
 playwright
 anthropic
 tradingview_ta
+exchange-calendars==4.13.2

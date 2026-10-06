@@ -217,22 +217,58 @@ def fetch_tv_rsi(name: str) -> float:
 _YF_DAILY = {}   # ticker -> DataFrame[Close, Volume], naive local dates
 
 
-def yf_daily(tickers: list, days: int = 500) -> dict:
+def yf_daily(tickers: list, days: int = 500, expected_date=None, expected_sessions=None) -> dict:
     """{ticker: DataFrame[Close, Volume]} for `days` back, including the latest
     bars (Yahoo's `end` is exclusive, so end = now + 2 days). Downloads only
     what isn't cached yet, in chunks, and backs off when Yahoo rate-limits."""
     import time
-    have = {t for t, df in _YF_DAILY.items() if df.attrs.get("days", 0) >= days}
+    import json
+    import hashlib
+    from reliability import atomic_json
+    cache_dir = Path(__file__).parent / 'data' / 'daily_bars'
+    def cache_path(t):
+        return cache_dir / (hashlib.sha256(t.encode()).hexdigest() + '.json')
+    def valid(frame):
+        if frame is None or frame.empty or frame.attrs.get('days', 0) < days:
+            return False
+        if expected_date is None:
+            return True
+        day = pd.Timestamp(expected_date)
+        if expected_sessions is not None:
+            import numpy as np
+            window = frame.reindex(expected_sessions)[['Close','Volume']]
+            if not (np.isfinite(window).all().all() and window['Close'].gt(0).all()
+                    and window['Volume'].ge(0).all()):
+                return False
+        return (day in frame.index and pd.notna(frame.loc[day, 'Close'])
+                and pd.notna(frame.loc[day, 'Volume']) and frame.loc[day, 'Volume'] >= 0)
+    for t in dict.fromkeys(tickers):
+        if t not in _YF_DAILY and expected_date:
+            try:
+                payload = json.loads(cache_path(t).read_text())
+                frame = pd.read_json(io.StringIO(payload['frame']), orient='split')
+                frame.index = pd.to_datetime(frame.index)
+                frame.attrs['days'] = payload['days']
+                if payload.get('session') == expected_date:
+                    _YF_DAILY[t] = frame
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+    have = {t for t, df in _YF_DAILY.items() if valid(df)}
     missing = [t for t in dict.fromkeys(tickers) if t not in have]
-    start, end = datetime.now() - timedelta(days=days), datetime.now() + timedelta(days=2)
-    for i in range(0, len(missing), 200):
-        todo = missing[i:i + 200]
-        for attempt in range(4):
+    start = (datetime.now() - timedelta(days=days)).date().isoformat()
+    end = (datetime.now() + timedelta(days=2)).date().isoformat()
+    for i in range(0, len(missing), 50):
+        todo = missing[i:i + 50]
+        for attempt in range(3):
+            started = time.monotonic()
             try:
                 df = yf.download(todo, start=start, end=end, progress=False, auto_adjust=False,
-                                 group_by="ticker", threads=True)
-            except Exception:
+                                 group_by="ticker", threads=4, timeout=30)
+            except Exception as exc:
+                print(f'DOWNLOAD error attempt={attempt+1}: {type(exc).__name__}: {exc}', flush=True)
                 df = pd.DataFrame()
+            if len(todo) > 1 and not isinstance(df.columns, pd.MultiIndex):
+                df = pd.DataFrame()  # Never assign one symbol's bars to multiple symbols.
             for t in todo:
                 try:
                     x = df[t] if isinstance(df.columns, pd.MultiIndex) else df
@@ -246,11 +282,15 @@ def yf_daily(tickers: list, days: int = 500) -> dict:
                 x = x[~x.index.duplicated(keep="last")]
                 x.attrs["days"] = days
                 _YF_DAILY[t] = x
-            todo = [t for t in todo if t not in _YF_DAILY]
-            # A few names are always missing (delisted); many missing = rate limit
-            if len(todo) <= 0.05 * 200 or attempt == 3:
+                if expected_date:
+                    atomic_json(cache_path(t), {'ticker': t, 'days': days, 'session': expected_date,
+                                               'frame': x.to_json(orient='split', date_format='iso')})
+            todo = [t for t in todo if not valid(_YF_DAILY.get(t))]
+            print(f'DOWNLOAD batch={i//50+1} attempt={attempt+1} seconds={time.monotonic()-started:.1f} '
+                  f'expected={expected_date} unresolved={len(todo)} tickers={todo}', flush=True)
+            if not todo or attempt == 2:
                 break
-            time.sleep(30 * (attempt + 1))
+            time.sleep(5 * (2 ** attempt))
         time.sleep(1)
     return {t: _YF_DAILY[t] for t in tickers if t in _YF_DAILY}
 

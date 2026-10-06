@@ -1,0 +1,38 @@
+name: Independent daily pipeline health
+on:
+  schedule:
+    # After 20:40 New York in both DST and standard time; offset from busy hour.
+    - cron: '47 1 * * *'
+    - cron: '47 2 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: independent-pipeline-health
+  cancel-in-progress: false
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Configure existing server credentials
+        env:
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -eu
+          test -n "$SERVER_IP"
+          test -n "$SSH_PRIVATE_KEY"
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Public host key verified through the existing authenticated SSH connection.
+          printf '%s %s\n' "$SERVER_IP" 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMrR5ss5mRi1LzvQsCVYqAHeEGLsqguEsXPknrPB7ZCW' > ~/.ssh/known_hosts
+      - name: Verify dashboard and last completed daily run
+        env:
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+        run: |
+          set -eu
+          curl --fail --silent --show-error --max-time 30 "http://$SERVER_IP/sentiment/" > /dev/null
+          ssh -o BatchMode=yes -o ConnectTimeout=15 "root@$SERVER_IP" \
+            'timeout 90 runuser -u rays -- /opt/rays/venv/bin/python /opt/rays/pipeline_health.py'
